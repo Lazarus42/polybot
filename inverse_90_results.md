@@ -15,6 +15,7 @@
 - **Mean P&L**: **+2.38199**
 - **Median P&L**: **-1.00**
 - **Min / Max P&L**: **-1.00 / +999.00**
+- **Total profit (sum of P&L)**: **+4,511.49** across 1,894 trades
 
 ### Distribution shape (qualitative)
 - **Extremely skewed / heavy‑tailed**: most trades lose the full $1, while a small number of wins pay out very large multiples (because the opposite side is purchased at very low prices like 1–5¢).
