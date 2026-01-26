@@ -1,0 +1,15 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+
+# Large data files
+archive/processed/trades.csv
+archive/goldsky/orderFilled.csv
+archive.tar.xz
+
+# Reports / outputs (keep if you want; remove if you want tracked)
+reports/
