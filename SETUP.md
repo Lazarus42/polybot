@@ -68,6 +68,88 @@ python scripts/opposite_90_random_slugs.py \
   --summary reports/opposite_90_random_4000_summary.json
 ```
 
+### 4) MOST IMPORTANT: Jake’s Codex experiment (repeat 100x on 100 random markets)
+This takes priority over all other experiments.
+
+Goal: **100 independent trials**. Each trial:
+1) randomly sample **100 resolved binary markets**
+2) run **inverse 90¢** strategy on that 100‑market sample
+3) collect P&L + distribution stats
+4) repeat for **0% fees** and **2% fees**
+5) save the **total profit per trial** and analyze the distribution of totals
+
+**Suggested workflow (repeatable, deterministic seeds):**
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+import subprocess
+
+TRIALS = 100
+N = 100
+FEES = [0.0, 0.02]
+OUT_DIR = Path("reports/jake_trials")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+def run_trial(trial_idx, fee):
+    slugs = OUT_DIR / f"slugs_trial_{trial_idx:03d}_fee_{int(fee*100)}.txt"
+    summary = OUT_DIR / f"summary_trial_{trial_idx:03d}_fee_{int(fee*100)}.json"
+    pnl = OUT_DIR / f"pnl_trial_{trial_idx:03d}_fee_{int(fee*100)}.csv"
+
+    # generate 100 random slugs with a fixed seed per trial
+    subprocess.run([
+        "python", "scripts/generate_random_slugs.py",
+        "--count", str(N),
+        "--seed", str(1000 + trial_idx),
+        "--output", str(slugs),
+    ], check=True)
+
+    # run inverse 90¢ strategy on that slug sample
+    subprocess.run([
+        "python", "scripts/opposite_90_random_slugs.py",
+        "--slugs", str(slugs),
+        "--output", str(pnl),
+        "--summary", str(summary),
+    ], check=True)
+
+    return summary
+
+def collect_totals(fee):
+    totals = []
+    for trial_idx in range(TRIALS):
+        summary_path = OUT_DIR / f"summary_trial_{trial_idx:03d}_fee_{int(fee*100)}.json"
+        with open(summary_path) as f:
+            s = json.load(f)
+        # total profit = mean * count
+        if s.get("pnl_mean") is None or s.get("with_pnl") is None:
+            continue
+        totals.append(s["pnl_mean"] * s["with_pnl"])
+    return totals
+
+# Run all trials for each fee
+for fee in FEES:
+    for trial_idx in range(TRIALS):
+        run_trial(trial_idx, fee)
+
+# Aggregate totals
+for fee in FEES:
+    totals = collect_totals(fee)
+    out = OUT_DIR / f"totals_fee_{int(fee*100)}.json"
+    out.write_text(json.dumps({
+        "fee": fee,
+        "trials": len(totals),
+        "totals": totals,
+        "mean_total": sum(totals)/len(totals) if totals else None,
+        "min_total": min(totals) if totals else None,
+        "max_total": max(totals) if totals else None,
+    }, indent=2))
+PY
+```
+
+**Outputs to review:**
+- `reports/jake_trials/summary_trial_*.json` (per‑trial P&L stats + distribution)
+- `reports/jake_trials/totals_fee_0.json` and `totals_fee_2.json` (distribution of total profit across 100 trials)
+
 ### 4) Notes / gotchas
 - The `trades.csv` file is very large (~33GB); scripts that scan it can take several minutes.
 - The repo ignores `reports/` by default. If you want to keep reports, remove it from `.gitignore`.
