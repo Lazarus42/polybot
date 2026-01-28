@@ -20,6 +20,7 @@ def main() -> None:
     parser.add_argument("--markets", default="archive/markets.csv")
     parser.add_argument("--trades", default="archive/processed/trades.csv")
     parser.add_argument("--threshold", type=float, default=0.9)
+    parser.add_argument("--fee-rate", type=float, default=0.0)
     parser.add_argument("--output", default="reports/opposite_90_random_4000_pnl.csv")
     parser.add_argument("--summary", default="reports/opposite_90_random_4000_summary.json")
     args = parser.parse_args()
@@ -116,7 +117,12 @@ def main() -> None:
         if opp_price <= 0:
             continue
         opp_won = side != winner_token
-        pnl = (1.0 / opp_price - 1.0) if opp_won else -1.0
+        if opp_won:
+            gross = 1.0 / opp_price
+            fee_paid = gross * args.fee_rate
+            pnl = gross - 1.0 - fee_paid
+        else:
+            pnl = -1.0
         pnl_values.append(pnl)
         if opp_won:
             wins += 1
