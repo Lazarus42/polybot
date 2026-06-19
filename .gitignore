@@ -10,6 +10,7 @@ __pycache__/
 archive/processed/trades.csv
 archive/goldsky/orderFilled.csv
 archive.tar.xz
+archive/processed/underdog_events/fills_sorted.parquet
 
 # Reports / outputs (keep if you want; remove if you want tracked)
 reports/

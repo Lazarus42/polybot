@@ -69,7 +69,10 @@ def load_markets(path: Path) -> Dict[str, MarketMeta]:
             if not answer1 or not answer2 or not slug or not closed:
                 continue
             try:
-                closed_dt = datetime.fromisoformat(closed.replace("Z", "+00:00"))
+                normalized = closed.replace("Z", "+00:00")
+                if normalized.endswith("+00"):
+                    normalized = normalized[:-3] + "+00:00"
+                closed_dt = datetime.fromisoformat(normalized)
             except ValueError:
                 continue
             markets[mid] = MarketMeta(

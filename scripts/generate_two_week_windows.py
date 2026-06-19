@@ -34,7 +34,10 @@ def main() -> None:
             if not closed or not slug:
                 continue
             try:
-                dt = datetime.fromisoformat(closed.replace("Z", "+00:00"))
+                normalized = closed.replace("Z", "+00:00")
+                if normalized.endswith("+00"):
+                    normalized = normalized[:-3] + "+00:00"
+                dt = datetime.fromisoformat(normalized)
             except ValueError:
                 continue
             rows.append((dt, slug))

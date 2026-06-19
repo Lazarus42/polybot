@@ -1,0 +1,14 @@
+{
+  "format_version": 1,
+  "source_trades": "archive/processed/trades.csv",
+  "source_markets": "archive/markets.csv",
+  "source_resolutions": "reports/windows",
+  "market_count": 58521,
+  "markets_with_fills": 52007,
+  "deduplicated_fill_count": 64688572,
+  "fills_bytes": 1919763579,
+  "markets_bytes": 3027472,
+  "deduplication": "Exact duplicate processed rows are collapsed; source_row_count preserves multiplicity.",
+  "sort_order": ["market_id", "timestamp", "transaction_hash", "side", "price"],
+  "price_filter": "0 < price < 1"
+}
