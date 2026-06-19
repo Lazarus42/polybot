@@ -26,6 +26,15 @@ python scripts/build_underdog_dataset.py
 
 The build scans the full 33 GB CSV archive, deduplicates fills, and writes clustered Parquet. It is a one-time operation.
 
+Alternatively, download the prepared 1.8 GB fill Parquet from the GitHub release:
+
+```bash
+mkdir -p archive/processed/underdog_events
+curl -L \
+  https://github.com/Lazarus42/polybot/releases/download/underdog-data-2026-06-19/fills_sorted.parquet \
+  -o archive/processed/underdog_events/fills_sorted.parquet
+```
+
 ## Optimize parameters
 
 ```bash
@@ -185,3 +194,16 @@ scripts/run_realistic_underdog_account.sh
 
 See `REALISTIC_UNDERDOG_SIMULATION.md` for the exact market-selection, execution,
 look-ahead controls, current results, and data limitations.
+
+## Monthly cohorts and global price gate
+
+Run independent `$5,000` monthly accounts using both `$1`-until-exhausted and
+availability-sized deployment:
+
+```bash
+scripts/run_monthly_underdog_experiments.sh
+```
+
+This compares the per-entry-level optimizer, train-selected category/horizon gates,
+and one global TP/SL pair with a calibration-selected purchase-price range. See
+`MONTHLY_UNDERDOG_RESULTS.md` for results.

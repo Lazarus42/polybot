@@ -7,6 +7,18 @@ markets. The execution model is a counterfactual application of Kalshi's standar
 event-contract fee formula, one-cent price ticks, and 0.01-contract order increments.
 It is not a backtest on historical Kalshi order books.
 
+The 1.8 GB deduplicated fill-level Parquet is published as a GitHub Release asset:
+
+```bash
+curl -L \
+  https://github.com/Lazarus42/polybot/releases/download/underdog-data-2026-06-19/fills_sorted.parquet \
+  -o archive/processed/underdog_events/fills_sorted.parquet
+```
+
+SHA-256: `2a5dfe36121b3352d8387f68d4892fec879762029eabcc82ce37d411f86fb0a6`.
+It is a release asset rather than a Git object because GitHub blocks regular files
+over 100 MiB and the repository owner's Git LFS budget is exhausted.
+
 For each market, the candidate underdog is identified causally:
 
 1. Treat the first archived trade as the market opening time.
@@ -75,6 +87,12 @@ Fill scenarios are:
 | Neutral | 25% | 0 ticks | 0 ticks |
 | Conservative | 10% | 1 adverse tick | 1 adverse tick |
 | Very conservative | 5% | 2 adverse ticks | 2 adverse ticks |
+
+For conservative TP/SL exits, the observed threshold-crossing fill must support the
+position at the 10% participation limit. Otherwise that exit is rejected and the
+position is held to actual close. This is stricter than assuming a price touch fills
+the complete order, but historical order-book queue and spread snapshots remain
+unavailable.
 
 ## Market and budget experiments
 
@@ -149,3 +167,12 @@ Run the capital-account experiments:
 ```bash
 scripts/run_realistic_underdog_account.sh
 ```
+
+Run independent `$5,000` monthly cohorts, literal `$1`-until-exhausted sizing, market
+gates, and the global price-range strategy:
+
+```bash
+scripts/run_monthly_underdog_experiments.sh
+```
+
+See `MONTHLY_UNDERDOG_RESULTS.md` for the monthly results.

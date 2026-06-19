@@ -135,6 +135,8 @@ def run_account(
     stake: float,
     availability_lambda: Optional[float] = None,
     max_entries: Optional[int] = None,
+    allowed_levels: Optional[set[int]] = None,
+    budget_period: str = "week",
 ) -> dict[str, Any]:
     scenario = SCENARIOS[scenario_name]
     cash = initial_cash
@@ -147,7 +149,7 @@ def run_account(
     opened = 0
     exits = []
     open_positions: dict[int, dict[str, Any]] = {}
-    weekly_spend: dict[int, float] = defaultdict(float)
+    period_spend: dict[Any, float] = defaultdict(float)
     weekly_records: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     category_records: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     horizon_records: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
@@ -196,6 +198,9 @@ def run_account(
         if selector is None:
             skipped["untrained_level"] += 1
             continue
+        if allowed_levels is not None and level not in allowed_levels:
+            skipped["price_gate"] += 1
+            continue
         category = str(arrays["categories"][index])
         if category not in allowed_categories:
             skipped["category_gate"] += 1
@@ -206,12 +211,19 @@ def run_account(
             skipped["horizon_gate"] += 1
             continue
         week = int(week_id(float(entry_time)))
-        remaining_week = max(0.0, weekly_budget - weekly_spend[week])
-        if remaining_week <= 0:
-            skipped["weekly_budget"] += 1
+        if budget_period == "month":
+            entry_date = datetime.fromtimestamp(entry_time, timezone.utc)
+            period_key: Any = (entry_date.year, entry_date.month)
+        elif budget_period == "week":
+            period_key = week
+        else:
+            raise ValueError(f"Unknown budget period: {budget_period}")
+        remaining_period = max(0.0, weekly_budget - period_spend[period_key])
+        if remaining_period <= 0:
+            skipped[f"{budget_period}_budget"] += 1
             continue
         target = stake if availability_lambda is None else weekly_budget / max(1.0, availability_lambda)
-        target = min(target, remaining_week, cash)
+        target = min(target, remaining_period, cash)
         fill_cap = float(arrays["entry_fill"][index]) * scenario["participation"]
         if fill_cap < target:
             skipped["entry_liquidity_limited"] += 1
@@ -245,7 +257,7 @@ def run_account(
         cash -= debit
         fees += entry_fee
         deployed += debit
-        weekly_spend[week] += debit
+        period_spend[period_key] += debit
         opened += 1
         bucket = horizon_bucket(scheduled_horizon)
         position = {
