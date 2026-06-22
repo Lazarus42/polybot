@@ -1,0 +1,754 @@
+UNDERDOG ALLOCATION BACKTEST BRIEF FOR LLM REVIEW
+
+Purpose
+-------
+This document summarizes the current state of an online allocation backtest for an underdog betting/market strategy. It is intended to be pasted into an LLM for further analysis, critique, and experiment design.
+
+Important framing: this is a backtesting and allocation-design problem. Treat it as a research/engineering problem about causal online decision-making under uncertainty, fixed budgets, partial real-time market availability, noisy ROI estimates, and nonstationarity. Do not treat it as advice to wager real money.
+
+
+Project Context
+---------------
+We have an "optimal underdog strategy" that identifies candidate opportunities across different markets. The initial simple benchmark is:
+
+    Bet $1 on each qualifying market/opportunity.
+
+We want to improve this by learning fixed weights from training data and then using those weights to allocate a fixed budget across future opportunities.
+
+The complication is that in real time, the bot does not know the final set of markets that will be available over a whole week. Markets arrive/are seen chronologically, fills are limited, and the bot has to allocate causally using only information available at the time of execution.
+
+So the central problem is:
+
+    How should we allocate a fixed weekly budget across different markets/opportunities using fixed weights learned from historical data, when the real-time available opportunity set is unknown in advance?
+
+We tested this in a causal online backtest.
+
+
+Backtest Setup
+--------------
+Implemented and ran the causal online allocation backtest across:
+
+    - 4 chronological training/holdout cuts
+    - 172 policy configurations
+    - 9,030 contiguous weekly-policy observations
+
+The setup is intended to mimic how a real bot would behave:
+
+    - Early training segment selects TP/SL parameters.
+    - Later training-only calibration estimates ROI weights, thresholds, uncertainty, and weekly arrival rates.
+    - Parameters are frozen before each holdout.
+    - Markets are processed chronologically.
+    - Allocation never sees the final weekly opportunity set.
+    - Empty calendar weeks are retained.
+    - Kalshi fees are applied.
+    - Cent ticks and order rounding are applied.
+    - Weekly budget caps are applied.
+    - Liquidity caps are applied.
+    - $1 orders are subject to a bot-realistic 10% triggering-fill participation limit.
+
+Relevant code and files:
+
+    Code:
+        /Users/bringibson/Desktop/polybot/scripts/online_underdog_allocation.py
+
+    Run script:
+        /Users/bringibson/Desktop/polybot/scripts/run_online_underdog_allocation.sh
+
+    Weekly results:
+        /Users/bringibson/Desktop/polybot/reports/online_underdog_allocation/weekly_results.csv
+
+    Aggregate policy summary:
+        /Users/bringibson/Desktop/polybot/reports/online_underdog_allocation/aggregate_results.csv
+
+    Documentation:
+        /Users/bringibson/Desktop/polybot/underdog_workflow.md
+
+Command to run everything:
+
+    scripts/run_online_underdog_allocation.sh
+
+Custom cuts example:
+
+    scripts/run_online_underdog_allocation.sh \
+      --cut-fractions 0.65 0.75 0.85 \
+      --weekly-budget 1000 \
+      --participation 0.05
+
+
+Baseline Results: $1 Per Market
+-------------------------------
+The $1 equal-staking benchmark produced the following results:
+
+    Training cut    Holdout             Weeks    Profit    ROI deployed    Positive weeks
+    50%             Apr 2024-Sep 2025    75      $0        0%              0%
+    60%             Aug 2024-Sep 2025    60      $1,370    52.0%           86.7%
+    70%             Nov 2024-Sep 2025    45      $872      9.4%            80.0%
+    80%             Mar 2025-Sep 2025    30      $355      2.7%            73.3%
+
+Notes:
+
+    - The 50% cut makes no trades because no price level has the required 30 earlier fit observations.
+    - Average weekly deployment increases from $44 at the 60% cut to $432 at the 80% cut.
+    - ROI falls as deployment rises.
+    - The baseline remains profitable in the 60%, 70%, and 80% holdouts, but the deployed ROI decays substantially.
+
+Preliminary interpretation:
+
+    The edge may be real but thin.
+    As deployment increases, the strategy probably starts taking lower-quality opportunities.
+    A small equal-staking rule is robust, but scaling it naively may dilute the edge.
+
+
+Weighted Strategy Results
+-------------------------
+Weighted strategies performed well in older holdouts but failed in the latest one.
+
+Best weighted results by cut:
+
+    - 60% cut best:
+        two-stage/raw ROI, +$8,839
+
+    - 70% cut best:
+        normalized cash/profit-volume, +$7,870
+
+    - 80% cut best weighted strategy:
+        observed normalization/profit-volume, -$28
+
+    - Every other weighted strategy lost money in the latest 30-week holdout.
+
+Comparison with equal staking in latest holdout:
+
+    - $1 equal staking in 80% holdout: +$355
+    - Best weighted strategy in 80% holdout: -$28
+    - Most weighted strategies in 80% holdout: negative
+
+Additional market-level observation:
+
+    - Crypto alone lost $455 in the latest $1 holdout.
+    - Sports and uncategorized markets remained positive in the latest $1 holdout.
+
+Preliminary interpretation:
+
+    This is strong evidence that historical ROI weights are unstable across regimes.
+    Raw or aggressive ROI-based allocation probably overfits older regimes.
+    The issue is not merely allocation mechanics; the learned market-level ROI signal itself appears nonstationary.
+    Crypto may have undergone a regime shift or may be especially noisy/unstable.
+
+
+Main Conclusion
+---------------
+The current evidence favors equal small stakes over ROI-weighted sizing.
+
+However, this does not necessarily mean that all weighting is bad. A better interpretation is:
+
+    ROI-estimated weights are currently too high-variance and/or too nonstationary to be trusted as aggressive sizing multipliers.
+
+The best production baseline right now should probably be:
+
+    Small equal stakes, possibly with market-level risk gates.
+
+The next research question should not be:
+
+    "How do we maximize historical ROI using learned weights?"
+
+It should be:
+
+    "Can we improve equal $1 staking by removing or capping bad regimes/markets, without losing the robustness that made equal staking work?"
+
+This means we should separate:
+
+    1. Selection / gating:
+        Which markets/opportunities are allowed?
+
+    2. Sizing:
+        How much do we stake once an opportunity is allowed?
+
+Right now, ROI weighting is doing both. It says:
+
+    "This market had high historical ROI, so bet much more on it."
+
+That is dangerous if market-level ROI is unstable. Historical ROI should probably be used as a weak gating/capping signal, not as a large sizing multiplier.
+
+
+Recommended Current Champion Policy
+-----------------------------------
+The current champion should probably be something like:
+
+    Equal Small Stake with Market Risk Gates
+
+Pseudo-policy:
+
+    For each available opportunity, processed chronologically:
+
+        1. Determine market group.
+        2. Check whether market group is allowed.
+        3. If allowed:
+              stake $1, subject to liquidity, participation, and weekly budget caps.
+           Else:
+              skip.
+        4. Never use the final weekly opportunity set.
+        5. Never update parameters during holdout except under explicitly tested online rules.
+
+Possible market-group allow rule:
+
+    allow market_group if:
+        - enough calibration observations exist
+        - shrunk ROI or CLV is positive
+        - recent rolling performance is not strongly negative
+        - group-level drawdown is below threshold
+        - market group is not currently in a detected bad regime
+
+This should be tested against the plain $1 baseline.
+
+
+Important Design Principle
+--------------------------
+Use ROI mostly as a filter/gate, not as an aggressive size multiplier.
+
+Bad/fragile design:
+
+    Bet much more because historical ROI was high.
+
+Better design:
+
+    Permit, cap, or slightly tilt exposure based on robust evidence.
+
+In other words:
+
+    ROI signal should answer:
+        "Is this market safe/eligible enough to include?"
+
+    Not:
+        "How much should we lever this market?"
+
+
+Next Experiments to Run
+-----------------------
+
+1. Equal Stake + Market Gates
+-----------------------------
+Test equal $1 staking with market-level filters.
+
+Examples:
+
+    Policy A:
+        allow market m iff calibration ROI_m > 0
+
+    Policy B:
+        allow market m iff lower confidence bound ROI_m > 0
+
+    Policy C:
+        allow market m iff ROI_m > 0 in at least 3 of the last 4 rolling windows
+
+    Policy D:
+        allow market m iff recent 8/13/26-week ROI is not negative beyond threshold
+
+    Policy E:
+        allow market m iff market drawdown is below a threshold
+
+Important: keep the stake equal once allowed. Do not size aggressively by ROI.
+
+Goal:
+
+    Determine whether gating can improve the $1 baseline without introducing instability.
+
+
+2. Equal Stake + Crypto Ablations
+---------------------------------
+Because crypto lost $455 in the latest $1 holdout while sports and uncategorized markets remained positive, test:
+
+    - $1 all markets
+    - $1 excluding crypto
+    - $1 crypto capped
+    - $1 crypto only
+    - $1 sports only
+    - $1 uncategorized only
+    - $1 sports + uncategorized only
+    - $1 all except markets with negative recent rolling ROI
+
+For crypto specifically, test:
+
+    - exclude crypto entirely
+    - cap crypto weekly exposure
+    - cap crypto daily exposure
+    - allow crypto only if recent rolling performance is positive
+    - allow crypto only if CLV is positive, if CLV is available
+    - allow crypto only if enough recent observations exist
+
+Goal:
+
+    Determine whether crypto is a persistent drag, a recent-regime drag, or just noisy.
+
+
+3. Capped Tilt Weights Instead of Raw ROI Weights
+------------------------------------------------
+Instead of letting ROI weights create large allocation differences, test small tilts around equal stake.
+
+Example:
+
+    weight_m = clip(1 + alpha * z_m, lower, upper)
+
+where:
+
+    z_m = standardized/shrunk/uncertainty-adjusted ROI signal for market m
+
+Test:
+
+    alpha in {0.1, 0.25, 0.5, 1.0}
+    lower/upper bounds such as:
+        [0.5, 2.0]
+        [0.75, 1.5]
+        [0.8, 1.25]
+
+Then stake:
+
+    stake_i = base_stake * weight_market(i)
+
+subject to caps.
+
+Main question:
+
+    Is there any stable signal in historical ROI if we only allow it to mildly tilt around equal staking?
+
+If even mild tilts hurt, then historical ROI is probably not useful for sizing.
+
+
+4. Robust-Across-Cuts Policy Selection
+--------------------------------------
+Do not select policies by best average profit or best single holdout.
+
+Because 172 configurations were tested, best historical policies are likely affected by multiple testing and overfit.
+
+For each policy p, compute:
+
+    - profit by cut
+    - ROI by cut
+    - max drawdown by cut
+    - worst-cut profit
+    - worst-cut ROI
+    - median cut profit
+    - percent of cuts positive
+    - latest-cut profit
+    - latest-cut ROI
+
+Rank policies using robust criteria, such as:
+
+    Score(p) = median_profit(p) - lambda * max_drawdown(p)
+
+or:
+
+    Score(p) = min_cut_profit(p)
+
+or:
+
+    Score(p) = average_profit(p), subject to latest_cut_profit(p) >= 0
+
+or:
+
+    Score(p) = average_profit(p), subject to all cuts nonnegative
+
+The current baseline should be hard to beat:
+
+    A policy that makes less peak profit but is positive across all nonempty cuts may be better than a policy that crushes older cuts but fails in the latest cut.
+
+Goal:
+
+    Avoid choosing overfit policies that look good only because of policy search over many configurations.
+
+
+5. Rolling / Recency-Aware Weights
+----------------------------------
+All-history ROI appears stale. Test recency-sensitive signals.
+
+Possible windows:
+
+    - last 4 weeks
+    - last 8 weeks
+    - last 13 weeks
+    - last 26 weeks
+    - last 52 weeks
+
+Possible exponential decay:
+
+    ROI_m,t = sum_{s < t} gamma^(t-s) * profit_m,s
+              /
+              sum_{s < t} gamma^(t-s) * deployed_m,s
+
+Test:
+
+    gamma in {0.90, 0.95, 0.98, 0.995}
+
+But again, use recency-weighted ROI mainly for:
+
+    - gating
+    - caps
+    - mild tilts
+
+not aggressive allocation.
+
+Goal:
+
+    Determine whether market edges are regime-dependent and whether recent performance is more predictive than all-history performance.
+
+
+6. Delta vs $1 Baseline Diagnostics
+-----------------------------------
+For every policy p and every week t, compute:
+
+    delta_profit_{p,t} = weekly_profit_{p,t} - weekly_profit_$1,t
+
+Then summarize by cut and policy family:
+
+    - mean delta
+    - median delta
+    - percent of weeks better than $1
+    - worst week versus $1
+    - best week versus $1
+    - cumulative delta
+    - max drawdown of cumulative delta
+    - skewness / tail behavior if useful
+
+Table:
+
+    Cut | Policy family | Mean delta | Median delta | % weeks better | Worst delta week | Cumulative delta
+
+This answers:
+
+    Are weighted policies systematically adding value,
+    or are they occasionally levering into lucky weeks while worsening the left tail?
+
+Hypothesis:
+
+    Weighted policies have fat positive tails in older holdouts but worse downside / left-tail behavior in the latest holdout.
+
+
+7. Policy Family Median, Not Just Best Policy
+---------------------------------------------
+For each policy family, report:
+
+    - best policy
+    - median policy
+    - 25th percentile
+    - 75th percentile
+    - worst policy
+    - percent profitable
+    - percent beating $1
+    - latest holdout median performance
+
+Policy families might include:
+
+    - equal stake
+    - observed normalization
+    - normalized cash
+    - two-stage raw ROI
+    - two-stage profit-volume
+    - availability-adjusted
+    - rank-greedy
+    - Kelly/fractional edge sizing, if implemented
+    - capped tilt
+    - market gates
+
+Goal:
+
+    Avoid being fooled by the best member of a large, overfit family.
+
+
+8. Selection vs Sizing Decomposition
+------------------------------------
+Decompose the weighted policies into:
+
+    - Which opportunities they selected/skipped.
+    - How much they sized each selected opportunity.
+
+For each weighted policy, compare against $1 baseline:
+
+    A. Same selected opportunities as weighted policy, but equal $1 stakes.
+    B. Same selected opportunities as $1 baseline, but weighted sizing.
+    C. Full weighted policy.
+
+This tells us whether the policy's value/damage comes from:
+
+    - better/worse selection
+    - better/worse sizing
+    - both
+
+Hypothesis:
+
+    The weighted policies may be selecting okay opportunities but sizing badly due to unstable ROI weights.
+
+
+9. Market-Level Stability Analysis
+----------------------------------
+For each market group, compute:
+
+    - profit by cut
+    - ROI by cut
+    - deployed amount by cut
+    - number of trades by cut
+    - positive-week rate by cut
+    - rolling ROI
+    - drawdown
+    - CLV if available
+    - correlation between training ROI and holdout ROI
+    - correlation between recent ROI and next-period ROI
+
+Especially inspect:
+
+    - crypto
+    - sports
+    - uncategorized
+
+Key question:
+
+    Does market-level ROI have any out-of-sample persistence?
+
+If the correlation between training ROI and holdout ROI is near zero or negative, do not use historical ROI for sizing.
+
+
+10. Budget Utilization / Capacity Curve
+---------------------------------------
+The deployed ROI falls as weekly deployment rises:
+
+    - 60% cut: average weekly deployment around $44, ROI 52.0%
+    - 80% cut: average weekly deployment around $432, ROI 2.7%
+
+This suggests capacity constraints or edge dilution.
+
+Run capacity curves:
+
+    weekly_budget in:
+        25, 50, 100, 250, 500, 1000, 2000
+
+    participation in:
+        0.01, 0.025, 0.05, 0.10
+
+For each, evaluate:
+
+    - total profit
+    - ROI
+    - average deployed
+    - percent budget used
+    - max drawdown
+    - positive weeks
+    - profit per week
+
+Goal:
+
+    Estimate how much capital the strategy can absorb before the edge decays.
+
+
+11. Regime Shift / Time Trend Analysis
+--------------------------------------
+Because the latest holdout is much worse for weighted strategies and ROI falls over time, test for regime shifts.
+
+Diagnostics:
+
+    - rolling weekly ROI for $1 strategy
+    - rolling weekly ROI by market
+    - rolling number of opportunities
+    - rolling average odds/price level
+    - rolling fill rate
+    - rolling market mix
+    - rolling profit decomposition by market
+    - compare pre-2025 vs 2025
+    - compare latest 30 weeks vs earlier holdouts
+
+Possible explanations:
+
+    - the underdog edge is decaying
+    - market composition changed
+    - crypto market behavior changed
+    - fills became worse
+    - the strategy scaled into weaker opportunities
+    - TP/SL parameters selected on old data no longer fit
+    - ROI weights overfit market groups that stopped working
+
+Goal:
+
+    Determine whether the edge is structurally decaying or just unstable across market categories.
+
+
+12. CLV-Based Diagnostics, If Available
+---------------------------------------
+If closing line value is available, use it heavily.
+
+For each policy and market group, compute:
+
+    - average CLV
+    - CLV by cut
+    - CLV by market
+    - correlation between CLV and realized profit
+    - CLV for weighted strategies vs $1
+    - CLV for crypto vs sports/uncategorized
+
+If a strategy has positive realized ROI but no CLV, it may be lucky.
+If a strategy has bad realized ROI but positive CLV, it may still have a real edge but high variance.
+
+Potential robust gate:
+
+    allow market iff recent CLV is positive or lower-confidence-bound CLV is positive.
+
+Goal:
+
+    Find a less noisy proxy for true edge than realized ROI.
+
+
+13. Threshold and Price-Level Robustness
+----------------------------------------
+The 50% cut makes no trades because no price level has the required 30 earlier fit observations.
+
+Test sensitivity to:
+
+    - minimum fit observations:
+        10, 20, 30, 50, 100
+
+    - price level grouping:
+        exact cent level
+        bucketed levels
+        wider price buckets
+        market-type + price bucket
+        global fallback when market-specific data is sparse
+
+    - shrinkage:
+        price-level ROI shrunk to market ROI
+        market ROI shrunk to global ROI
+        hierarchical shrinkage
+
+Goal:
+
+    Avoid brittle sparsity rules that create no-trade behavior or overfit small cells.
+
+
+14. Hierarchical Shrinkage for ROI Estimates
+--------------------------------------------
+Raw ROI by market/price level is noisy. Use shrinkage.
+
+Example:
+
+    shrunk_roi_m = alpha_m * observed_roi_m + (1 - alpha_m) * global_roi
+
+where:
+
+    alpha_m = n_m / (n_m + k)
+
+Test:
+
+    k in {10, 25, 50, 100, 250}
+
+For price level cells:
+
+    shrunk_roi_cell =
+        alpha_cell * observed_roi_cell
+        + (1 - alpha_cell) * parent_market_roi
+
+Then parent market ROI itself is shrunk to global ROI.
+
+Use lower-confidence-bound ROI:
+
+    lcb_roi = shrunk_roi - z * standard_error
+
+Test:
+
+    z in {0.0, 0.5, 1.0, 1.64, 1.96}
+
+Use LCB for gating, not aggressive sizing.
+
+Goal:
+
+    Reduce overreaction to noisy historical winners.
+
+
+15. Drawdown and Tail Risk
+--------------------------
+For each policy, calculate:
+
+    - maximum drawdown
+    - longest losing streak
+    - worst week
+    - worst 4-week period
+    - worst 8-week period
+    - CVaR / average of worst x% weeks
+    - standard deviation of weekly profit
+    - downside deviation
+    - profit skew
+
+A policy with higher average profit but much worse drawdown may be worse than $1 equal staking.
+
+Goal:
+
+    Quantify whether weighted allocation is adding unacceptable tail risk.
+
+
+Suggested Final Decision Criteria
+---------------------------------
+A new allocation policy should not replace $1 equal staking unless it satisfies most of:
+
+    - positive in the latest 80% holdout
+    - positive or at least not meaningfully negative across all nonempty cuts
+    - beats $1 on cumulative profit
+    - does not materially worsen max drawdown
+    - does not rely on one market group, especially crypto
+    - has reasonable budget utilization
+    - has policy-family-level robustness, not just one lucky configuration
+    - passes delta-vs-$1 diagnostics
+    - remains positive under slightly different cuts, e.g. 65%, 75%, 85%
+    - remains positive under lower participation assumptions, e.g. 5%
+    - has interpretable failure modes
+
+Potential production choice right now:
+
+    Champion:
+        $1 equal staking with current bot-realistic constraints.
+
+    Challenger 1:
+        $1 equal staking excluding or capping crypto.
+
+    Challenger 2:
+        $1 equal staking with market gates based on recent/shrunk/LCB ROI.
+
+    Challenger 3:
+        capped mild-tilt weights around equal stake.
+
+Avoid for now:
+
+    - raw ROI weighting
+    - aggressive profit-volume weighting
+    - unconstrained normalized weighting
+    - strategies selected only because they were best among 172 configurations
+    - policies that lose in the latest holdout
+
+
+Concrete Requests for the LLM
+-----------------------------
+Given the above, please do the following:
+
+1. Review the experimental design for look-ahead leakage or unrealistic assumptions.
+2. Evaluate whether the interpretation is correct: equal small stakes appear robust, while ROI-weighted sizing appears unstable/nonstationary.
+3. Propose a prioritized set of next experiments.
+4. Suggest exact policy rules to implement for:
+       - market gates
+       - crypto caps/exclusions
+       - capped ROI tilts
+       - recency-aware gates
+       - robust policy selection
+5. Suggest additional diagnostics to distinguish:
+       - true edge decay
+       - capacity/scale dilution
+       - market-mix shift
+       - overfit ROI weights
+       - bad crypto regime
+       - variance/luck
+6. Suggest how to structure the analysis tables/plots.
+7. Suggest how to choose a production champion/challenger policy.
+8. Be skeptical of strategies that win only in older holdouts or only as the best of many tested configurations.
+9. Prefer causal, bot-realistic, deployable policies over idealized offline policies.
+
+
+Preferred Tone for Response
+---------------------------
+Please be direct, technical, and skeptical. Focus on actionable next experiments and implementation details. Avoid generic advice. Treat this as a serious backtesting/machine-learning allocation problem under nonstationarity and causal execution constraints.
+
+
+One-Sentence Summary
+--------------------
+The current evidence says: equal $1 underdog staking is a robust baseline, while historical ROI weighting is unstable and likely overfit/nonstationary; the next step is to test market gates, crypto caps, mild capped tilts, robust-across-cut selection, and delta-vs-$1 diagnostics rather than aggressive ROI-based sizing.

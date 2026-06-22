@@ -17,6 +17,7 @@ from online_underdog_allocation import CATEGORIES, execution_model, week_id, wee
 from realistic_underdog_account import (
     DAY,
     HORIZONS,
+    attach_exit_paths,
     calibration_category_sets,
     fit_brackets,
     gate_score,
@@ -37,10 +38,15 @@ def month_count(start: int, end: int) -> float:
 
 def load_arrays(report_dir: Path, data_dir: Path) -> tuple[dict[str, np.ndarray], np.ndarray]:
     data = np.load(report_dir / "strategy_cube.npz")
+    required = {"underdog_sides"}
+    missing = required - set(data.files)
+    if missing:
+        raise SystemExit(f"strategy cube missing {sorted(missing)}; rerun optimize_underdog_bracket.py")
     order = np.argsort(data["entry_times"], kind="stable")
     arrays = {
         "market_ids": data["market_ids"][order],
         "times": data["entry_times"][order],
+        "sides": data["underdog_sides"][order],
         "prices": data["entry_prices"][order],
         "levels": data["entry_levels"][order],
         "scheduled_end": data["scheduled_end_times"][order],
@@ -207,6 +213,7 @@ def main() -> None:
     arrays, weeks = load_arrays(args.report_dir, args.data_dir)
     all_weeks = np.arange(int(weeks.min()), int(weeks.max()) + 1)
     execution = execution_model(args.report_dir)
+    attach_exit_paths(arrays, args.data_dir, execution)
     monthly_rows = []
     gate_rows = []
     cut_rows = []

@@ -123,8 +123,11 @@ independent sample size explicit.
 
 The walk-forward command reads `strategy_cube.npz`, produced by the optimizer. It
 reselects parameters using only earlier weeks in each fold. The liquidity and bankroll
-tests cap fills using the observed dollars in the triggering archived fill; this is a
-more conservative capacity model than assuming the full target order always fills.
+tests cap fills using observed archived fill size. Account simulations now work out
+of TP/SL exits across later same-side fills when the first threshold-crossing fill is
+too small, rather than rejecting the exit and holding the full position to close.
+This is still more conservative than assuming the full target order always fills at
+the first threshold touch.
 
 ## Slow strategy sweep
 
@@ -207,3 +210,51 @@ scripts/run_monthly_underdog_experiments.sh
 This compares the per-entry-level optimizer, train-selected category/horizon gates,
 and one global TP/SL pair with a calibration-selected purchase-price range. See
 `MONTHLY_UNDERDOG_RESULTS.md` for results.
+
+## Long holdouts and sizing policies
+
+Run continuous-account holdouts over 3, 6, 12, and all available holdout months while
+comparing modular sizing policies:
+
+```bash
+scripts/run_long_holdout_weighting_experiments.sh
+```
+
+The runner fits brackets on the early training segment, chooses market gates on the
+calibration segment, fits sizing weights from calibration-only bucket statistics, and
+then replays longer holdouts under the realistic partial-exit account simulator.
+
+Sizing policies currently available:
+
+- `flat_one`: fixed `$1` per eligible market.
+- `availability`: period budget divided by expected eligible opportunities.
+- `ev_weighted`: bucket budget proportional to shrunk expected return.
+- `lcb_weighted`: bucket budget proportional to lower-confidence-bound return.
+- `hybrid_floor_ev`: `$1` floor plus EV-weighted overlay.
+- `hybrid_floor_lcb`: `$1` floor plus LCB-weighted overlay.
+- `equal_positive_bucket`: equal budget across calibration-positive buckets.
+- `fractional_kelly`: clipped fractional Kelly using conservative edge and second
+  moment.
+- `forecast_paced`: live-bankroll pacing that preserves a cash reserve, estimates
+  remaining opportunities from calibration bucket arrival rates, and scales a floor
+  stake plus quality overlay by remaining opportunity flow.
+
+The realistic account treats `$5,000` as total bankroll. It enforces cash reuse only
+after exits, a reserve floor, minimum entry liquidity, minimum time to close, and
+locked-capital caps by market category and entry-price regime. The default long
+holdout comparison includes `flat_one`, `availability`, `hybrid_floor_lcb`,
+`fractional_kelly`, and `forecast_paced`.
+
+The optimizer also writes price-aware exit candidates to `strategy_cube.npz` when
+regenerated. These candidates include single exits, basis-recovery ladders, staged
+low-price runners, and high-price harvest exits. Account replay uses the same
+partial-fill model for candidate exits as for legacy TP/SL exits.
+
+Outputs in `reports/long_holdout_weighting`:
+
+- `account_summary.csv`: policy, gate, cut, holdout-window, profit, drawdown, entries,
+  deployment, and skip diagnostics.
+- `gate_selection.csv`: calibration gate candidates and selected gate evidence.
+- `sizing_bucket_stats.csv`: bucket-level opportunity counts, lambdas, means, shrunk
+  means, LCBs, and second moments.
+- `training_cuts.csv`: fit, calibration, and holdout boundaries.

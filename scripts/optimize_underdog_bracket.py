@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import duckdb
 import matplotlib.pyplot as plt
@@ -41,6 +41,16 @@ def parse_values(value: str) -> list[float]:
 
 def entry_level(price: float) -> int:
     return max(1, min(49, int(price * 100 + 1e-9)))
+
+
+def price_regime_for_level(level: int) -> str:
+    if level <= 5:
+        return "01-05c"
+    if level <= 15:
+        return "06-15c"
+    if level <= 30:
+        return "16-30c"
+    return "31-49c"
 
 
 def quantize_price(price: float, tick: float) -> float:
@@ -97,6 +107,158 @@ def max_contracts_for_budget(
     return contracts, debit
 
 
+def feasible_multiplier(entry_price: float, multiplier: float) -> bool:
+    return entry_price * multiplier < 0.995
+
+
+def exit_policy_templates() -> list[dict[str, Any]]:
+    policies: list[dict[str, Any]] = []
+    single_by_regime = {
+        "01-05c": [2, 3, 5, 7.5, 10, 15, 20, 50],
+        "06-15c": [1.5, 2, 2.5, 3, 4, 5, 7.5, 10],
+        "16-30c": [1.25, 1.5, 1.75, 2, 2.5, 3],
+        "31-49c": [1.1, 1.25, 1.5, 1.75, 2],
+    }
+    for regime, multipliers in single_by_regime.items():
+        for multiplier in multipliers:
+            policies.append({
+                "name": f"{regime}_single_{multiplier:g}x",
+                "family": "single_exit",
+                "regime": regime,
+                "stop_loss": 0.5,
+                "tranches": [{"multiplier": multiplier, "fraction": 1.0}],
+                "runner_to_resolution": False,
+            })
+    for regime, runners in {
+        "01-05c": [5, 10, 20, 50],
+        "06-15c": [3, 5, 7.5, 10],
+        "16-30c": [2.5, 3],
+    }.items():
+        for runner in runners:
+            policies.append({
+                "name": f"{regime}_basis_2x_runner_{runner:g}x",
+                "family": "basis_recovery",
+                "regime": regime,
+                "stop_loss": 0.5,
+                "tranches": [
+                    {"multiplier": 2.0, "fraction": 0.5},
+                    {"multiplier": runner, "fraction": 0.5},
+                ],
+                "runner_to_resolution": True,
+            })
+    for runner in [5, 10, 20, 50]:
+        policies.append({
+            "name": f"01-05c_staged_2x_5x_runner_{runner:g}x",
+            "family": "staged_ladder",
+            "regime": "01-05c",
+            "stop_loss": 0.4,
+            "tranches": [
+                {"multiplier": 2.0, "fraction": 0.33},
+                {"multiplier": 5.0, "fraction": 0.33},
+                {"multiplier": runner, "fraction": 0.34},
+            ],
+            "runner_to_resolution": True,
+        })
+    for regime in ("16-30c", "31-49c"):
+        policies.append({
+            "name": f"{regime}_harvest_125_175",
+            "family": "high_price_harvest",
+            "regime": regime,
+            "stop_loss": 0.75,
+            "tranches": [
+                {"multiplier": 1.25, "fraction": 0.5},
+                {"multiplier": 1.75, "fraction": 0.5},
+            ],
+            "runner_to_resolution": False,
+        })
+        policies.append({
+            "name": f"{regime}_harvest_15_2",
+            "family": "high_price_harvest",
+            "regime": regime,
+            "stop_loss": 0.75,
+            "tranches": [
+                {"multiplier": 1.5, "fraction": 0.5},
+                {"multiplier": 2.0, "fraction": 0.5},
+            ],
+            "runner_to_resolution": False,
+        })
+    return policies
+
+
+def policy_required_take_profits(policies: list[dict[str, Any]]) -> list[float]:
+    values = []
+    for policy in policies:
+        for tranche in policy["tranches"]:
+            values.append(float(tranche["multiplier"]))
+    return values
+
+
+def policy_required_stop_losses(policies: list[dict[str, Any]]) -> list[float]:
+    return [float(policy["stop_loss"]) for policy in policies if policy.get("stop_loss", 0) > 0]
+
+
+def evaluate_exit_policy(
+    entry: Entry,
+    policy: dict[str, Any],
+    take_profits: list[float],
+    stop_losses: list[float],
+    fee_coefficient: float,
+) -> tuple[float, int, float, int]:
+    level = entry_level(entry.entry_price)
+    if policy["regime"] != price_regime_for_level(level):
+        return float("nan"), np.iinfo(np.int64).max, np.nan, 0
+
+    resolution_price = 1.0 if entry.underdog_side == entry.winner_side else 0.0
+    stop_loss = float(policy.get("stop_loss", 0.0))
+    stop_hit = None
+    if stop_loss > 0:
+        stop_hit = entry.stop_loss_hits[stop_losses.index(stop_loss)]
+
+    events = []
+    for tranche_index, tranche in enumerate(policy["tranches"]):
+        multiplier = float(tranche["multiplier"])
+        if not feasible_multiplier(entry.entry_price, multiplier):
+            continue
+        hit = entry.take_profit_hits[take_profits.index(multiplier)]
+        if hit is not None:
+            events.append((hit[0], hit[1], hit[2], tranche_index))
+    events.sort(key=lambda item: item[0])
+
+    if stop_hit is not None and (not events or stop_hit[0] < events[0][0]):
+        pnl = continuous_return(entry.entry_price, stop_hit[2], fee_coefficient)
+        return pnl, int(stop_hit[1].timestamp()), stop_hit[2], 2
+
+    remaining = 1.0
+    proceeds = 0.0
+    filled_tranches: set[int] = set()
+    last_exit_time = entry.closed_time
+    last_exit_price = resolution_price
+    for _, timestamp, price, tranche_index in events:
+        if tranche_index in filled_tranches:
+            continue
+        fraction = min(remaining, float(policy["tranches"][tranche_index]["fraction"]))
+        if fraction <= 0:
+            continue
+        gross = 1.0 + continuous_return(entry.entry_price, price, fee_coefficient)
+        proceeds += fraction * gross
+        remaining -= fraction
+        filled_tranches.add(tranche_index)
+        last_exit_time = timestamp
+        last_exit_price = price
+        if remaining <= 1e-9:
+            break
+
+    if remaining > 1e-9:
+        gross = 1.0 + continuous_return(entry.entry_price, resolution_price, fee_coefficient)
+        proceeds += remaining * gross
+        last_exit_time = entry.closed_time
+        last_exit_price = resolution_price
+        exit_code = 0
+    else:
+        exit_code = 3 if policy["family"] != "single_exit" else 1
+    return proceeds - 1.0, int(last_exit_time.timestamp()), last_exit_price, exit_code
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Optimize underdog brackets by 1-cent entry level.")
     parser.add_argument("--data-dir", type=Path, default=Path("archive/processed/underdog_events"))
@@ -118,8 +280,9 @@ def main() -> None:
         parser.error("entry bounds must satisfy 0 < min <= max < 1")
     if not 0 < args.train_fraction < 1:
         parser.error("train fraction must be between 0 and 1")
-    take_profits = parse_values(args.take_profits)
-    stop_losses = parse_values(args.stop_losses)
+    exit_policies = exit_policy_templates()
+    take_profits = sorted(set(parse_values(args.take_profits) + policy_required_take_profits(exit_policies)))
+    stop_losses = sorted(set(parse_values(args.stop_losses) + policy_required_stop_losses(exit_policies)))
     if any(value <= 1 for value in take_profits):
         parser.error("all take-profit multipliers must exceed 1")
     if any(not 0 <= value < 1 for value in stop_losses):
@@ -244,6 +407,12 @@ def main() -> None:
     exit_prices = np.empty_like(strategy_cube, dtype=np.float32)
     exit_fill_cube = np.empty_like(strategy_cube, dtype=np.float32)
     exit_codes = np.empty_like(strategy_cube, dtype=np.uint8)
+    candidate_returns = np.full((len(entry_list), len(exit_policies)), np.nan, dtype=np.float32)
+    candidate_exit_times = np.full(
+        (len(entry_list), len(exit_policies)), np.iinfo(np.int64).max, dtype=np.int64
+    )
+    candidate_exit_prices = np.full((len(entry_list), len(exit_policies)), np.nan, dtype=np.float32)
+    candidate_exit_codes = np.zeros((len(entry_list), len(exit_policies)), dtype=np.uint8)
     for entry_index, entry in enumerate(entry_list):
         level = entry_level(entry.entry_price)
         resolution_price = 1.0 if entry.underdog_side == entry.winner_side else 0.0
@@ -281,6 +450,15 @@ def main() -> None:
                 values[0] += 1
                 values[1] += pnl
                 values[2] += pnl > 0
+        for policy_index, policy in enumerate(exit_policies):
+            pnl, exit_time, exit_price, exit_code = evaluate_exit_policy(
+                entry, policy, take_profits, stop_losses, args.fee_coefficient
+            )
+            if math.isfinite(pnl):
+                candidate_returns[entry_index, policy_index] = pnl
+                candidate_exit_times[entry_index, policy_index] = exit_time
+                candidate_exit_prices[entry_index, policy_index] = exit_price
+                candidate_exit_codes[entry_index, policy_index] = exit_code
 
     grid_rows = []
     for (level, take_profit, stop_loss, split), (count, pnl, profitable) in sorted(stats.items()):
@@ -548,6 +726,7 @@ def main() -> None:
             dtype=np.int64,
         ),
         entry_prices=np.array([entry.entry_price for entry in entry_list], dtype=np.float32),
+        underdog_sides=np.array([entry.underdog_side for entry in entry_list]),
         entry_fill_usd=np.array(
             [entry.entry_fill_usd for entry in entry_list], dtype=np.float64
         ),
@@ -568,6 +747,16 @@ def main() -> None:
         exit_codes=exit_codes,
         take_profits=np.array(take_profits, dtype=np.float32),
         stop_losses=np.array(stop_losses, dtype=np.float32),
+        candidate_returns=candidate_returns,
+        candidate_exit_times=candidate_exit_times,
+        candidate_exit_prices=candidate_exit_prices,
+        candidate_exit_codes=candidate_exit_codes,
+        candidate_names=np.array([policy["name"] for policy in exit_policies]),
+        candidate_families=np.array([policy["family"] for policy in exit_policies]),
+        candidate_regimes=np.array([policy["regime"] for policy in exit_policies]),
+        candidate_policy_json=np.array(
+            [json.dumps(policy, sort_keys=True) for policy in exit_policies]
+        ),
     )
 
     levels = [row["entry_level_cents"] for row in best_rows]

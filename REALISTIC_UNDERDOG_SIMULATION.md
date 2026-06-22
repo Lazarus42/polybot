@@ -68,11 +68,13 @@ The account tracks:
 - weekly deployment; and
 - category and scheduled-horizon attribution.
 
-TP/SL exits use the first later archived fill crossing the selected level. If the
-triggering exit fill cannot support the position under the selected participation
-limit, the conservative simulator does not claim that fill and holds the position to
-the actual market close. Actual close and resolution values affect the account only
-when simulated time reaches the close.
+TP/SL exits start at the first later archived fill crossing the selected level. If
+the triggering exit fill cannot support the full position under the selected
+participation limit, the simulator exits whatever that fill can support, then keeps
+working out of the remaining position across later same-side fills at their observed
+prices after exit slippage. Any contracts still open after the later fill path runs
+out settle at actual market close. Actual close and resolution values affect the
+account only when simulated time reaches the close.
 
 Positions open at the holdout boundary are marked at cost because the archive lacks
 reliable point-in-time bid/ask snapshots at arbitrary evaluation times. Their eventual
@@ -88,11 +90,22 @@ Fill scenarios are:
 | Conservative | 10% | 1 adverse tick | 1 adverse tick |
 | Very conservative | 5% | 2 adverse ticks | 2 adverse ticks |
 
-For conservative TP/SL exits, the observed threshold-crossing fill must support the
-position at the 10% participation limit. Otherwise that exit is rejected and the
-position is held to actual close. This is stricter than assuming a price touch fills
-the complete order, but historical order-book queue and spread snapshots remain
-unavailable.
+For conservative TP/SL exits, each observed same-side fill contributes at most 10%
+of its historical size. This is stricter than assuming a price touch fills the
+complete order, but less punitive than rejecting an underfilled threshold touch and
+holding the whole position to close. Historical order-book queue and spread
+snapshots remain unavailable.
+
+The smart-allocation simulator now treats `$5,000` as total bankroll rather than a
+recurring spend allowance. It can preserve a cash reserve, reject entries below a
+minimum executable stake, require enough time to close, cap locked capital by
+category and entry-price regime, and pace `forecast_paced` stakes from calibration
+opportunity-arrival rates.
+
+When `strategy_cube.npz` is regenerated, it also includes price-aware exit candidate
+families. These include single exits, basis-recovery ladders, staged low-price
+runners, and high-price harvest exits. Low-cent entries can keep runner exposure to
+larger multiples, while high-cent entries are evaluated with faster feasible exits.
 
 ## Market and budget experiments
 
@@ -108,7 +121,7 @@ Availability-adjusted stake is the weekly target divided by the expected eligibl
 opportunity count learned from calibration. It does not normalize using markets that
 arrive later in the holdout week.
 
-## Current results
+## Prior results
 
 The train-selected gates were:
 
@@ -136,6 +149,10 @@ and 250 positions were modestly positive, but 500 were approximately flat and 5,
 lost $284. The current data does not support the hypothesis that simply adding more
 market positions reliably captures a profitable tail-event edge.
 
+These figures were generated before the partial-exit replay change. Regenerate the
+strategy cube and rerun the account/monthly experiments before quoting updated
+performance.
+
 ## Remaining limitations
 
 The largest unresolved issue is source-universe selection. The compact Parquet was
@@ -161,6 +178,9 @@ Rebuild the enriched compact strategy cube:
   --initial-capital 5000 \
   --output-dir reports/underdog_optimization_kalshi
 ```
+
+Rerun this after code updates that change `strategy_cube.npz`; the account simulator
+requires the saved underdog side for each entry to replay later same-side exit fills.
 
 Run the capital-account experiments:
 

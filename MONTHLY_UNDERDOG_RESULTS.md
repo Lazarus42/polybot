@@ -9,7 +9,8 @@ All entries use the conservative fill model:
 - at most 10% of the triggering entry and exit fill;
 - one adverse cent at entry and exit;
 - Kalshi-style fees, one-cent ticks, and 0.01-contract rounding; and
-- if the first TP/SL crossing cannot support the exit, hold until actual close.
+- if the first TP/SL crossing cannot support the full exit, keep exiting across
+  later same-side fills until the position is closed or the market resolves.
 
 Two sizing rules are reported:
 
@@ -29,7 +30,7 @@ Two sizing rules are reported:
 The latest 80% cut selected no crypto, a scheduled horizon of at most three days,
 a 7.5x take-profit, no stop, and entry prices from 1 to 35 cents for the global model.
 
-## `$1` Until Exhausted
+## Prior `$1` Until Exhausted
 
 Across the five complete months in the latest holdout:
 
@@ -54,7 +55,7 @@ Latest full-month `$1` realized profit:
 | 2025-07 | -$145.16 | -$98.66 | -$88.76 |
 | 2025-08 | -$352.42 | -$116.47 | -$62.46 |
 
-## Availability-Sized `$5,000` Attempt
+## Prior Availability-Sized `$5,000` Attempt
 
 Latest-cut complete-month results:
 
@@ -82,3 +83,6 @@ scripts/run_monthly_underdog_experiments.sh
 ```
 
 Detailed outputs are in `reports/monthly_underdog_experiments`.
+
+The result tables above were generated before the partial-exit replay change. Rerun
+the monthly experiments before quoting updated performance.
