@@ -53,6 +53,45 @@ backtest reports `breakeven_capture_share` to test this against the real pools.
 - Reward-aware MM backtest is built and unit-tested but **needs the new capture** (the old
   capture is crypto-heavy, calm, ~100 fills, reward-less — not a valid test).
 
+## Phase 3 — durable data collection (EC2 → S3)
+
+The principle: **land raw immutable, transform later.** The collector is dumb and crash-proof
+(receive → gzip spool → upload → delete); anything clever (per-market layout, Parquet, dedup)
+is a *replayable* batch step over raw — you can't un-lose real-time data.
+
+- **Collector** (`scripts/collect_clob_book.py`): one WebSocket connection, gzip spool files
+  rotated every `--rotate-minutes` (closed as `*.jsonl.gz` for the uploader), `--rediscover-minutes`
+  re-scans gamma and **dynamically subscribes to newly-listed markets** while **pruning resolved
+  ones** (via `market_resolved`) to stay under `--max-subscriptions` (~500, the WS per-connection
+  cap). Selection is strategy-bucketed: `rewards / liquid / volatile / basket / longshot`, each
+  event tagged with category, negRisk, reward params, horizon. Penny (1-8¢) legs are captured
+  even when below the per-event liquidity cap, so **longshot strategies are testable** (with real
+  spreads/depth, unlike the historical tape). Recurring ultra-short crypto (`up-or-down`, `-5m-`)
+  is always excluded as noise; substantive crypto is kept in raw and filtered at analysis time.
+- **Deployment** (`deploy/`): `bootstrap.sh` (EC2 user-data) installs the collector as a systemd
+  service + a 15-min cron `upload_to_s3.sh`; `s3-write-policy.json` is the least-privilege IAM
+  role; `README.md` has the setup. Free-tier `t3.micro`, same-region S3 (free transfer), ~few $/mo.
+- **S3 layout**: `raw/dt=YYYY-MM-DD/*.jsonl.gz` (immutable, market id in every record) +
+  `manifests/*.json` (tags + reward params). Per-market / Parquet via later compaction.
+
+### Collect (nearly) all of Polymarket — BUILT
+
+`scripts/collect_all.py` is the full-universe fleet: it paginates gamma for every active market
+(~2,100 events → ~13k tokens; gamma caps `limit`=100/page and offset ~2,000, so this is the whole
+tradeable universe ranked by volume), shards across ~450-token WebSocket connections (one
+`collect_clob_book.py` child per shard, pid-unique spool files). **Zero-gap, no restarts:** it
+re-enumerates every 30 min and adds newly-listed markets *live* via a per-shard add-inbox file
+(`--add-file`), while each child prunes its own resolved markets on `market_resolved` and reports
+its live set back (`--status-file`) so the launcher knows true occupancy; overflow spins up an extra
+shard, and a child is only relaunched if it *crashes*. This matters because resolutions/trades are
+point events — a periodic full-restart would lose any that fall in the blackout. Same raw→S3
+pipeline. Runs via `deploy/polybot-collect-all.service` on a **`t3.large`** (memory headroom for
+~30 child processes; gzip+parse CPU is light). ~$30-60 total for a month of *everything* — which
+future-proofs every analysis (cross-event arb, longshots, MM) and removes selection bias.
+`--min-liquidity` trims the illiquid mid-priced tail *without* dropping penny longshots (kept
+regardless of liquidity). The targeted single-collector mode (free `t3.micro`, ~500 tokens) remains
+for a lighter run. `python scripts/collect_all.py --dry-run` previews event/token/shard counts.
+
 ## Next steps
 
 1. Let the collector accumulate several days of reward-eligible, non-crypto markets.
@@ -76,4 +115,4 @@ backtest reports `breakeven_capture_share` to test this against the real pools.
 | `scripts/walk_forward_residual_portfolio.py` | utility-objective portfolio with slippage |
 
 Detailed writeups: `reports/FINDINGS.md`, `reports/OBJECTIVE_REDESIGN_RESULTS.md`,
-`reports/CAPACITY_STRATEGY_NOTES.md`. Tests: `tests/` (89 passing).
+`reports/CAPACITY_STRATEGY_NOTES.md`. Tests: `tests/` (102 passing).

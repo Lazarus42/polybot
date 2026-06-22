@@ -7,7 +7,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from collect_clob_book import select_target_markets, select_target_events, _is_crypto
+from collect_clob_book import (select_target_markets, select_target_events, _is_crypto,
+                               tokens_to_add, _due, resolved_asset_ids)
 
 
 def ev(slug, markets, title="", tags=None, neg_risk=False, end_date=None):
@@ -15,16 +16,24 @@ def ev(slug, markets, title="", tags=None, neg_risk=False, end_date=None):
             "tags": [{"slug": t} for t in (tags or [])], "negRisk": neg_risk, "endDate": end_date}
 
 
-def mk(slug, liq, move=0.0, vol24=0.0, q="", toks=("a", "b")):
+def mk(slug, liq, move=0.0, vol24=0.0, q="", toks=("a", "b"), price=0.5, mid=None):
     return {"slug": slug, "question": q, "liquidityNum": liq, "oneDayPriceChange": move,
-            "volume24hr": vol24, "clobTokenIds": json.dumps(list(toks))}
+            "volume24hr": vol24, "clobTokenIds": json.dumps(list(toks)), "bestAsk": price,
+            "id": mid or slug}
 
 
 class TestDiscovery(unittest.TestCase):
-    def test_excludes_crypto(self):
-        self.assertTrue(_is_crypto(mk("bitcoin-up-or-down-15m-123", 1e5)))
-        self.assertTrue(_is_crypto({"slug": "x", "question": "Will ETH be above $4000?"}))
-        self.assertFalse(_is_crypto(mk("will-trump-pardon-someone", 1e5)))
+    def test_recurring_always_excluded_substantive_crypto_optional(self):
+        from collect_clob_book import _event_excluded
+        recurring = ev("btc-up-or-down-15m-123", [mk("m", 1e5)], title="BTC up or down")
+        subst = ev("btc-100k-2026", [mk("m", 1e5, q="Will BTC be above $100k by 2026?")], title="BTC 100k")
+        normal = ev("trump-pardon", [mk("m", 1e5)], title="Will Trump pardon someone?")
+        # recurring excluded even with exclude_crypto=False
+        self.assertTrue(_event_excluded(recurring, exclude_crypto=False))
+        # substantive crypto kept when not excluding, dropped when excluding
+        self.assertFalse(_event_excluded(subst, exclude_crypto=False))
+        self.assertTrue(_event_excluded(subst, exclude_crypto=True))
+        self.assertFalse(_event_excluded(normal, exclude_crypto=True))
 
     def test_min_liquidity_filter(self):
         markets = [mk("low", 1000, toks=("LOW1", "LOW2")), mk("ok", 50000, toks=("OK1", "OK2"))]
@@ -65,6 +74,19 @@ class TestTaxonomy(unittest.TestCase):
         self.assertIn("horizon_days", r)
 
 
+class TestLongshotBucket(unittest.TestCase):
+    def test_cheap_legs_captured_even_when_not_top_liquidity(self):
+        # big event: 15 liquid favorites + 2 penny longshots beyond the per-event cap
+        favs = [mk(f"fav{i}", 1e5 - i, toks=(f"F{i}", f"f{i}"), price=0.5, mid=f"fav{i}")
+                for i in range(15)]
+        longs = [mk("long-a", 100, toks=("LA", "la"), price=0.03, mid="long-a"),
+                 mk("long-b", 100, toks=("LB", "lb"), price=0.05, mid="long-b")]
+        e = ev("race", favs + longs, title="Who wins?")
+        toks = select_target_events([e], n_events=5, min_liquidity=5000)
+        self.assertIn("LA", toks)   # penny legs captured despite low liquidity
+        self.assertIn("LB", toks)
+
+
 class TestEventSelection(unittest.TestCase):
     def test_captures_one_token_per_outcome_of_multioutcome_event(self):
         multi = ev("election", [mk("c-a", 1e5, toks=("A1", "A2")),
@@ -87,6 +109,46 @@ class TestEventSelection(unittest.TestCase):
         toks = select_target_events([crypto, normal], n_events=5, min_liquidity=5000, max_tokens=2)
         self.assertNotIn("X1", toks)
         self.assertLessEqual(len(toks), 2)
+
+
+class TestCollectAll(unittest.TestCase):
+    def test_all_tokens_includes_low_liq_penny_and_excludes_crypto(self):
+        from collect_clob_book import all_tokens_from_events
+        events = [
+            ev("race", [mk("fav", 1e5, toks=("F", "f"), price=0.6, mid="fav"),
+                        mk("dust", 200, toks=("D", "d"), price=0.03, mid="dust")], title="Who wins?"),
+            ev("eth", [mk("m", 1e6, q="Will ETH rise?", toks=("E", "e"), mid="m")], title="ETH"),
+            ev("dead", [mk("x", 50, toks=("X", "x"), price=0.5, mid="x")], title="dead market"),
+        ]
+        toks, meta = all_tokens_from_events(events, min_liquidity=1000, exclude_crypto=True)
+        self.assertIn("F", toks)              # liquid favorite
+        self.assertIn("D", toks)              # penny longshot kept despite low liquidity
+        self.assertNotIn("E", toks)           # crypto excluded
+        self.assertNotIn("X", toks)           # below floor and not a penny longshot
+        self.assertIn("category", meta["F"])  # per-token meta carried
+
+    def test_shard(self):
+        from collect_all import shard
+        s = shard(list(range(1000)), 450)
+        self.assertEqual([len(x) for x in s], [450, 450, 100])
+
+
+class TestRediscovery(unittest.TestCase):
+    def test_tokens_to_add_only_new(self):
+        current = {"a", "b"}
+        self.assertEqual(tokens_to_add(current, ["a", "c", "b", "d", "c"]), ["c", "d"])
+        self.assertEqual(tokens_to_add(current, ["a", "b"]), [])
+
+    def test_due(self):
+        self.assertTrue(_due(0.0, 200.0, 180.0))     # 200s elapsed >= 180s
+        self.assertFalse(_due(100.0, 200.0, 180.0))  # only 100s elapsed
+        self.assertFalse(_due(0.0, 200.0, 0.0))      # interval 0 = disabled
+
+    def test_resolved_asset_ids(self):
+        payload = [{"event_type": "market_resolved", "winning_asset_id": "W1", "winning_outcome": "Yes"},
+                   {"event_type": "price_change", "price_changes": []}]
+        self.assertEqual(resolved_asset_ids(payload), ["W1"])
+        self.assertEqual(resolved_asset_ids({"event_type": "book", "asset_id": "X"}), [])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,27 @@
+[Unit]
+Description=Polymarket CLOB collect-ALL fleet (sharded full-universe capture)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/polymarket_exp
+Environment=PYTHONUNBUFFERED=1
+# Enumerates ALL active markets, shards across ~450-token WebSocket connections (one child
+# process each). ZERO-GAP: re-enumerates every 30 min and adds newly-listed markets LIVE to a
+# shard's add-inbox (no restart); each child prunes its own resolved markets, so resolutions are
+# never lost to a restart gap. Children write pid-unique gzip spool files the cron uploader ships.
+ExecStart=/home/ec2-user/polymarket_exp/.venv/bin/python scripts/collect_all.py \
+    --shard-size 450 --re-enumerate-minutes 30 --rotate-minutes 15 --min-liquidity 1000 \
+    --output-dir /home/ec2-user/polymarket_exp/reports/clob_capture
+Restart=always
+RestartSec=15
+# the fleet opens many sockets/files
+LimitNOFILE=65536
+# stop the whole process group (kills child shards too)
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

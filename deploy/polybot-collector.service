@@ -1,0 +1,22 @@
+[Unit]
+Description=Polymarket CLOB L2 order-book collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/polymarket_exp
+Environment=PYTHONUNBUFFERED=1
+# runs ~forever (huge --minutes); rotates a spool file every 15 min for the uploader;
+# re-scans gamma every 30 min and dynamically subscribes to newly-listed markets,
+# pruning resolved ones to stay under the --max-subscriptions cap.
+ExecStart=/home/ec2-user/polymarket_exp/.venv/bin/python scripts/collect_clob_book.py \
+    --discover 100 --max-tokens 500 --max-subscriptions 500 --min-liquidity 5000 \
+    --minutes 1000000000 --rotate-minutes 15 --rediscover-minutes 30 \
+    --output-dir /home/ec2-user/polymarket_exp/reports/clob_capture
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
