@@ -313,6 +313,7 @@ def run_collector(tokens: list[str], out_dir: Path, minutes: float, rotate_minut
     markets without dropping existing ones. Runs until `minutes` elapse (use a huge value under
     systemd). `max_local_gb` is a safety stop if the uploader is failing and spool grows."""
     import gzip  # noqa: PLC0415
+    import threading  # noqa: PLC0415
     import websocket  # noqa: PLC0415  (websocket-client)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -418,6 +419,18 @@ def run_collector(tokens: list[str], out_dir: Path, minutes: float, rotate_minut
         write_status()
         print(f"subscribed to {len(st['tokens'])} tokens -> {out_dir}")
 
+        def keepalive():
+            # Polymarket expects an APP-LEVEL "PING" string; its server does not reliably answer
+            # WebSocket protocol pings, so relying on those falsely trips "ping/pong timed out"
+            # (especially across many connections). Server replies "PONG" (non-JSON -> dropped).
+            while getattr(ws, "keep_running", False):
+                time.sleep(10)
+                try:
+                    ws.send("PING")
+                except Exception:
+                    break
+        threading.Thread(target=keepalive, daemon=True).start()
+
     def on_message(ws, message):
         resolved = record(message)
         if resolved:
@@ -434,7 +447,7 @@ def run_collector(tokens: list[str], out_dir: Path, minutes: float, rotate_minut
         try:
             ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message,
                                         on_error=lambda w, e: print("ws error:", e))
-            ws.run_forever(ping_interval=20, ping_timeout=10)
+            ws.run_forever()   # app-level PING keepalive (above) instead of protocol ping/pong
         except Exception as exc:
             print("reconnecting after:", exc)
             time.sleep(3)
