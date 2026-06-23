@@ -15,7 +15,7 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/ec2-user/polymarket_exp/.venv/bin/python scripts/paper_sim.py \
     --live --configs neutral raw_momentum clv_debounce clv_full \
     --size 200 --capital 5000 --inv-cap-mult 1 --fill-model prorata --max-capture-share 0.10 \
-    --quote-latency 0.2 --cancel-on-move 0.01 \
+    --quote-latency 0.2 --cancel-on-move 0.01 --max-hold-minutes 120 \
     --manifest-dir /home/ec2-user/polymarket_exp/reports/clob_capture \
     --minutes 1000000000 --rotate-minutes 15 \
     --output-dir /home/ec2-user/polymarket_exp/reports/paper_sim

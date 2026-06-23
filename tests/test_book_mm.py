@@ -316,5 +316,18 @@ class TestLatencyPickoff(unittest.TestCase):
         self.assertEqual(len(self._run(0.5, cancel=0.02).fills), 0)
 
 
+class TestMaxHoldFlatten(unittest.TestCase):
+    def test_position_force_flattened_after_max_hold(self):
+        from quoter import Quoter
+        q = Quoter(our_size=100, inventory_cap=1000, fill_model="prorata", max_hold_seconds=10)
+        q.on_quote(0.0, 0.49, 0.51, 0, 0)
+        q.on_trade(1.0, 0.49, "SELL", 100)        # buy 100 -> inv long, clock starts
+        self.assertGreater(q.inv, 0.0)
+        q.on_quote(5.0, 0.49, 0.51, 0, 0)         # 4s held (<10): still carried
+        self.assertGreater(q.inv, 0.0)
+        q.on_quote(20.0, 0.49, 0.51, 0, 0)        # 19s held (>10): force-exit
+        self.assertEqual(q.inv, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

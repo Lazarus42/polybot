@@ -80,13 +80,15 @@ class PaperSim:
     def __init__(self, token_meta: dict, size: float, inv_cap_mult: float, configs: list[str],
                  fill_model: str, capture_mult: float, out_dir: Path, rotate_minutes: float,
                  capital: float = 0.0, max_capture_share: float = 1.0,
-                 quote_latency: float = 0.0, cancel_on_move: float = 0.0):
+                 quote_latency: float = 0.0, cancel_on_move: float = 0.0,
+                 max_hold_seconds: float = 0.0):
         self.meta = token_meta
         self.size = size; self.configs = configs
         self.kw = {c: dict(CONFIGS[c]) for c in configs}   # all configs run in parallel, same feed
         self.fill_model = fill_model; self.capture_mult = capture_mult
         self.max_capture_share = max_capture_share
         self.quote_latency = quote_latency; self.cancel_on_move = cancel_on_move
+        self.max_hold_seconds = max_hold_seconds
         self.inv_cap = size * inv_cap_mult
         # CAPITAL BUDGET: two-sided resting collateral is ~$1*size per market, so a fixed budget
         # funds floor(capital/size) markets — we quote the top-N by reward pool (the targetable
@@ -124,7 +126,8 @@ class PaperSim:
                                           reward_min_size=m["min_size"], reward_v_cents=m["v_cents"],
                                           max_capture_share=self.max_capture_share,
                                           quote_latency=self.quote_latency,
-                                          cancel_on_move=self.cancel_on_move, **self.kw[c])
+                                          cancel_on_move=self.cancel_on_move,
+                                          max_hold_seconds=self.max_hold_seconds, **self.kw[c])
             self.toks.add(tok)
         return True
 
@@ -189,15 +192,17 @@ class PaperSim:
         trade = sum(q.cash - q.fees + (q.inv * q.mids[-1][1] if q.mids else 0.0) for q in qs)
         return {"reward": reward, "trade": trade, "net": reward + trade,
                 "fills": sum(len(q.fills) for q in qs),
-                "inv": sum(abs(q.inv) for q in qs)}
+                "inv": sum(abs(q.inv) for q in qs),
+                "flat_cost": sum(q.flat_cost for q in qs), "n_flat": sum(q.n_flats for q in qs)}
 
     def heartbeat(self) -> str:
         head = f"[hb] msgs={self.msgs_in} markets={len(self.toks)} snapshots={self.n_snapshots}"
         lines = [head]
         for c in self.configs:                       # one line per strategy — head-to-head
             a = self._agg(c)
-            lines.append(f"   {c:13} reward=${a['reward']:.4f} trade=${a['trade']:.4f} "
-                         f"net=${a['net']:.4f} fills={a['fills']} |inv|={a['inv']:.1f}")
+            lines.append(f"   {c:13} reward=${a['reward']:.4f} net=${a['net']:.4f} "
+                         f"fills={a['fills']} |inv|={a['inv']:.0f} "
+                         f"flat_cost=${a['flat_cost']:.4f}({a['n_flat']})")
         return "\n".join(lines)
 
     def process_message(self, payload):
@@ -264,7 +269,8 @@ class PaperSim:
         for c in self.configs:
             a = self._agg(c)
             out["by_config"][c] = {"reward": round(a["reward"], 3), "trade_pnl": round(a["trade"], 3),
-                                   "net": round(a["net"], 3),
+                                   "net": round(a["net"], 3), "flatten_cost": round(a["flat_cost"], 3),
+                                   "n_flatten": a["n_flat"],
                                    "roc_on_budget": round(a["net"] / self.capital, 5) if self.capital > 0 else None}
         out["best_net"] = max(self.configs, key=lambda c: self._agg(c)["net"]) if self.toks else None
         return out
@@ -345,6 +351,8 @@ def main() -> None:
                     help="seconds our live quote lags the book (stale-order pickoff risk); 0=instant")
     ap.add_argument("--cancel-on-move", type=float, default=0.01,
                     help="cancel a resting quote when mid drifts more than this (price units); 0=off")
+    ap.add_argument("--max-hold-minutes", type=float, default=120.0,
+                    help="force-exit any position carried longer than this (resolution-risk control); 0=never")
     ap.add_argument("--output-dir", type=Path, default=Path("reports/paper_sim"))
     ap.add_argument("--rotate-minutes", type=float, default=15.0)
     ap.add_argument("--minutes", type=float, default=240.0, help="live run duration")
@@ -358,7 +366,8 @@ def main() -> None:
     sim = PaperSim(token_meta, args.size, args.inv_cap_mult, args.configs,
                    args.fill_model, args.capture_mult, args.output_dir, args.rotate_minutes,
                    capital=args.capital, max_capture_share=args.max_capture_share,
-                   quote_latency=args.quote_latency, cancel_on_move=args.cancel_on_move)
+                   quote_latency=args.quote_latency, cancel_on_move=args.cancel_on_move,
+                   max_hold_seconds=args.max_hold_minutes * 60.0)
     budget_n = (int(args.capital / args.size) if args.capital > 0 else None)
     print(f"paper-sim: configs={args.configs} size={args.size} capital=${args.capital:,.0f} "
           f"-> top {budget_n if budget_n else 'ALL'} markets by pool; "

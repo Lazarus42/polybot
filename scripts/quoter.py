@@ -29,7 +29,8 @@ class Quoter:
                  tox_threshold: float = 0.0, tox_window: float = 0.0, tox_cooldown: float = 0.0,
                  reward_pool: float = 0.0, reward_min_size: float = 0.0, reward_v_cents: float = 0.0,
                  fill_model: str = "fifo", capture_mult: float = 1.0, max_capture_share: float = 1.0,
-                 quote_latency: float = 0.0, cancel_on_move: float = 0.0):
+                 quote_latency: float = 0.0, cancel_on_move: float = 0.0,
+                 max_hold_seconds: float = 0.0):
         self.our_size = our_size; self.inventory_cap = inventory_cap
         self.maker_fee = maker_fee; self.mark_delay_s = mark_delay_s
         self.improve = improve; self.tick = tick
@@ -46,6 +47,11 @@ class Quoter:
         # flow can pick off a stale order); cancel_on_move>0 instantly pulls the live quote when the
         # mid has moved more than that from where the quote was set (the fast cancel-on-move defense).
         self.quote_latency = quote_latency; self.cancel_on_move = cancel_on_move
+        # risk control: if a position is carried longer than this, actively cross out of it (so we
+        # never hold inventory into a resolution, where it settles at $0/$1 not mid). 0 = never.
+        self.max_hold_seconds = max_hold_seconds
+        self.inv_since = None            # time inventory first became non-zero (for max-hold)
+        self.flat_cost = 0.0; self.n_flats = 0   # spread paid crossing out of stale inventory
         # runtime state
         self.cur_signal = signal
         self.want_bid = self.cur_signal >= -skew_threshold
@@ -146,6 +152,7 @@ class Quoter:
         if self.cancel_on_move > 0.0 and m is not None and self.live_mid is not None \
                 and abs(m - self.live_mid) > self.cancel_on_move:
             self.our_bid = self.our_ask = None
+        self._maybe_flatten(t)           # force-exit stale inventory on time alone (no trade needed)
 
     def _promote(self, t):
         """Apply the most recent DESIRED quote that is now older than quote_latency -> LIVE."""
@@ -210,6 +217,25 @@ class Quoter:
                 if m is not None:
                     self.gross_spread += fillable * (self.our_ask - m)
                     self.fills.append((t, -1, m)); self.last_ask_fill = (t, m)
+        # track how long we've been carrying a position, and force-exit if it's too old
+        self.inv_since = None if self.inv == 0 else (self.inv_since or t)
+        self._maybe_flatten(t)
+
+    def _maybe_flatten(self, t):
+        """Cross the spread to exit any position held longer than max_hold_seconds (resolution
+        risk control). Pays the half-spread to flatten — the realistic cost of not carrying it."""
+        if self.max_hold_seconds <= 0 or self.inv == 0 or self.inv_since is None:
+            return
+        if t - self.inv_since < self.max_hold_seconds:
+            return
+        m = self.mid()
+        if m is None or self.best_bid is None or self.best_ask is None:
+            return
+        half = (self.best_ask - self.best_bid) / 2
+        self.cash += self.inv * (m - (half if self.inv > 0 else -half))   # sell at bid / buy at ask
+        self.flat_cost += abs(self.inv) * half       # the spread we paid to get flat
+        self.n_flats += 1
+        self.inv = 0.0; self.inv_since = None
 
     def credit_sample(self, s_mid, q_bid_book, q_ask_book):
         """Accrue one per-minute reward sample from the CURRENT live quote placement."""
@@ -250,4 +276,5 @@ class Quoter:
             "quoting_days": ((self.last_quote_t - self.first_quote_t) / 86400.0)
             if (self.first_quote_t is not None and self.last_quote_t is not None) else 0.0,
             "reward": float(self.reward),
+            "flatten_cost": float(self.flat_cost), "n_flatten": int(self.n_flats),
         }
