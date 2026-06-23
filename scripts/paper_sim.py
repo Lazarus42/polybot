@@ -65,22 +65,24 @@ def load_token_meta(manifest: Path | None) -> dict:
 
 
 CONFIGS = {
+    "neutral": {},
+    "raw_momentum": dict(momentum_window=300, skew_threshold=0.005),
+    "clv_debounce": dict(momentum_window=300, skew_threshold=0.005, debounce_trades=10),
     "clv_full": dict(momentum_window=300, skew_threshold=0.005, debounce_trades=10, inv_skew=0.01,
                      vol_window=300, vol_spread_coeff=0.5, tox_threshold=0.01, tox_window=60,
                      tox_cooldown=60),
-    "neutral": {},
 }
 
 
 class PaperSim:
     """Holds per-token reconstructed book + Quoter; emits per-minute snapshots."""
 
-    def __init__(self, token_meta: dict, size: float, inv_cap_mult: float, config: str,
+    def __init__(self, token_meta: dict, size: float, inv_cap_mult: float, configs: list[str],
                  fill_model: str, capture_mult: float, out_dir: Path, rotate_minutes: float,
                  capital: float = 0.0):
         self.meta = token_meta
-        self.size = size; self.config = config
-        self.kw = dict(CONFIGS[config])
+        self.size = size; self.configs = configs
+        self.kw = {c: dict(CONFIGS[c]) for c in configs}   # all configs run in parallel, same feed
         self.fill_model = fill_model; self.capture_mult = capture_mult
         self.inv_cap = size * inv_cap_mult
         # CAPITAL BUDGET: two-sided resting collateral is ~$1*size per market, so a fixed budget
@@ -99,22 +101,27 @@ class PaperSim:
         self.rotate_s = rotate_minutes * 60.0
         self.bids: dict[str, dict] = defaultdict(dict)
         self.asks: dict[str, dict] = defaultdict(dict)
-        self.q: dict[str, Quoter] = {}
+        self.q: dict[tuple, Quoter] = {}      # (config, token) -> Quoter (all configs, same markets)
+        self.toks: set = set()                # tokens we've instantiated quoters for
         self.last_sample: dict[str, float] = {}
         self._w = None; self._w_opened = 0.0; self._w_path = None
         self.n_snapshots = 0; self.msgs_in = 0
 
-    def _quoter(self, tok: str) -> Quoter | None:
+    def _ensure(self, tok: str) -> bool:
+        """Ensure a Quoter exists for every config on this token; False if token isn't eligible."""
         m = self.meta.get(tok)
         if not m or m["v_cents"] <= 0:
-            return None
+            return False
         if self.allowed is not None and tok not in self.allowed:
-            return None   # outside the capital budget's top-N markets
-        if tok not in self.q:
-            self.q[tok] = Quoter(self.size, self.inv_cap, fill_model=self.fill_model,
-                                 capture_mult=self.capture_mult, reward_pool=m["pool"],
-                                 reward_min_size=m["min_size"], reward_v_cents=m["v_cents"], **self.kw)
-        return self.q[tok]
+            return False   # outside the capital budget's top-N markets
+        if tok not in self.toks:
+            for c in self.configs:
+                self.q[(c, tok)] = Quoter(self.size, self.inv_cap, fill_model=self.fill_model,
+                                          capture_mult=self.capture_mult, reward_pool=m["pool"],
+                                          reward_min_size=m["min_size"], reward_v_cents=m["v_cents"],
+                                          **self.kw[c])
+            self.toks.add(tok)
+        return True
 
     def _close_current(self):
         """Close the open spool and rename .tmp -> .jsonl.gz so the uploader only ever sees a
@@ -141,8 +148,8 @@ class PaperSim:
         return self._w
 
     def _maybe_sample(self, tok: str, t: float):
-        q = self.q.get(tok); m = self.meta.get(tok)
-        if not q or not m or t - self.last_sample.get(tok, -1e9) < SAMPLE_SECONDS:
+        m = self.meta.get(tok)
+        if tok not in self.toks or not m or t - self.last_sample.get(tok, -1e9) < SAMPLE_SECONDS:
             return
         bb_l = [(p, s) for p, s in self.bids[tok].items() if s > 0]
         ba_l = [(p, s) for p, s in self.asks[tok].items() if s > 0]
@@ -152,34 +159,41 @@ class PaperSim:
             return
         bb, ba = max(mn), min(mx)
         mid = (bb + ba) / 2.0
-        q1 = side_score(bb_l, mid, m["v_cents"], m["min_size"])
+        q1 = side_score(bb_l, mid, m["v_cents"], m["min_size"])   # competing depth — config-independent
         q2 = side_score(ba_l, mid, m["v_cents"], m["min_size"])
-        rw_before = q.reward
-        q.credit_sample(mid, q1, q2)
         self.last_sample[tok] = t
-        marked = q.cash + q.inv * mid - q.fees
         w = self._writer(t)
-        w.write(json.dumps({
-            "t": round(t, 1), "token": tok, "config": self.config, "size": self.size,
-            "mid": round(mid, 4), "our_bid": q.our_bid, "our_ask": q.our_ask,
-            "inv": round(q.inv, 2), "marked_pnl": round(marked, 4),
-            "reward_cum": round(q.reward, 4), "reward_step": round(q.reward - rw_before, 5),
-            "q_bid_book": round(q1, 1), "q_ask_book": round(q2, 1), "n_fills": len(q.fills),
-        }) + "\n")
+        for c in self.configs:                                   # one snapshot row per config
+            q = self.q[(c, tok)]
+            rw_before = q.reward
+            q.credit_sample(mid, q1, q2)
+            marked = q.cash + q.inv * mid - q.fees
+            w.write(json.dumps({
+                "t": round(t, 1), "token": tok, "config": c, "size": self.size,
+                "mid": round(mid, 4), "our_bid": q.our_bid, "our_ask": q.our_ask,
+                "inv": round(q.inv, 2), "marked_pnl": round(marked, 4),
+                "reward_cum": round(q.reward, 4), "reward_step": round(q.reward - rw_before, 5),
+                "q_bid_book": round(q1, 1), "q_ask_book": round(q2, 1), "n_fills": len(q.fills),
+            }) + "\n")
         w.flush()                 # flush gzip buffer to disk so the .tmp is readable + crash-durable
         self.n_snapshots += 1
 
+    def _agg(self, cfg: str) -> dict:
+        qs = [self.q[(cfg, t)] for t in self.toks]
+        reward = sum(q.reward for q in qs)
+        trade = sum(q.cash - q.fees + (q.inv * q.mids[-1][1] if q.mids else 0.0) for q in qs)
+        return {"reward": reward, "trade": trade, "net": reward + trade,
+                "fills": sum(len(q.fills) for q in qs),
+                "inv": sum(abs(q.inv) for q in qs)}
+
     def heartbeat(self) -> str:
-        fills = sum(len(q.fills) for q in self.q.values())
-        reward = sum(q.reward for q in self.q.values())
-        quoting = sum(1 for q in self.q.values() if q.our_bid is not None or q.our_ask is not None)
-        # trading P&L = cash from fills - fees + inventory marked at the live mid (adverse shows here)
-        trade_pnl = sum(q.cash - q.fees + (q.inv * q.mids[-1][1] if q.mids else 0.0)
-                        for q in self.q.values())
-        inv = sum(abs(q.inv) for q in self.q.values())
-        return (f"[hb] msgs={self.msgs_in} markets={len(self.q)} quoting_now={quoting} "
-                f"snapshots={self.n_snapshots} fills={fills} reward=${reward:.4f} "
-                f"trade_pnl=${trade_pnl:.4f} net=${reward + trade_pnl:.4f} |inv|={inv:.2f}")
+        head = f"[hb] msgs={self.msgs_in} markets={len(self.toks)} snapshots={self.n_snapshots}"
+        lines = [head]
+        for c in self.configs:                       # one line per strategy — head-to-head
+            a = self._agg(c)
+            lines.append(f"   {c:13} reward=${a['reward']:.4f} trade=${a['trade']:.4f} "
+                         f"net=${a['net']:.4f} fills={a['fills']} |inv|={a['inv']:.1f}")
+        return "\n".join(lines)
 
     def process_message(self, payload):
         """Handle one collector WS payload (book / price_change / last_trade_price). Idempotent."""
@@ -190,7 +204,7 @@ class PaperSim:
             t = _ts(e.get("timestamp"))
             if et == "book":
                 tok = str(e.get("asset_id") or "")
-                if not self._quoter(tok):
+                if not self._ensure(tok):
                     continue
                 self.bids[tok] = {pp: ss for pp, ss in
                                   ((_f(b.get("price")), _f(b.get("size"))) for b in (e.get("bids") or []))
@@ -203,7 +217,7 @@ class PaperSim:
             elif et == "price_change":
                 for pc in (e.get("price_changes") or []):
                     tok = str(pc.get("asset_id") or "")
-                    if not self._quoter(tok):
+                    if not self._ensure(tok):
                         continue
                     price, sz = _f(pc.get("price")), _f(pc.get("size"))
                     side = str(pc.get("side") or "").upper()
@@ -218,11 +232,11 @@ class PaperSim:
                     self._maybe_sample(tok, t)
             elif et == "last_trade_price":
                 tok = str(e.get("asset_id") or "")
-                q = self._quoter(tok)
                 p, s = _f(e.get("price")), _f(e.get("size"))
                 side = str(e.get("side") or "").upper()
-                if q and p is not None and s and side in ("BUY", "SELL"):
-                    q.on_trade(t, p, side, s)
+                if self._ensure(tok) and p is not None and s and side in ("BUY", "SELL"):
+                    for c in self.configs:                       # every strategy sees the same trade
+                        self.q[(c, tok)].on_trade(t, p, side, s)
 
     def _feed_quote(self, tok: str, t: float):
         bb_l = [(p, s) for p, s in self.bids[tok].items() if s > 0]
@@ -231,25 +245,24 @@ class PaperSim:
             return
         bb = max(bb_l, key=lambda x: x[0]); ba = min(ba_l, key=lambda x: x[0])
         if bb[0] < ba[0]:
-            self.q[tok].on_quote(t, bb[0], ba[0], bb[1], ba[1])
+            for c in self.configs:                               # every strategy sees the same book
+                self.q[(c, tok)].on_quote(t, bb[0], ba[0], bb[1], ba[1])
 
     def close(self):
         self._close_current()
 
     def summary(self) -> dict:
-        tot_reward = sum(q.reward for q in self.q.values())
-        tot_marked = sum(q.cash - q.fees for q in self.q.values())  # ex-inventory mark
-        deployed = len(self.q) * self.size            # ~$1*size resting collateral per market
-        net = tot_reward + tot_marked
-        s = {"config": self.config, "size": self.size, "capital_budget": self.capital,
-             "markets_quoted": len(self.q), "capital_deployed_est": round(deployed, 0),
-             "snapshots": self.n_snapshots, "total_reward": round(tot_reward, 2),
-             "total_trading_cash": round(tot_marked, 2), "net": round(net, 2)}
-        if deployed > 0:
-            s["roc_on_deployed"] = round(net / deployed, 4)
-        if self.capital > 0:
-            s["roc_on_budget"] = round(net / self.capital, 4)
-        return s
+        deployed = len(self.toks) * self.size          # ~$1*size resting collateral per market
+        out = {"size": self.size, "capital_budget": self.capital, "markets_quoted": len(self.toks),
+               "capital_deployed_est": round(deployed, 0), "snapshots": self.n_snapshots,
+               "by_config": {}}
+        for c in self.configs:
+            a = self._agg(c)
+            out["by_config"][c] = {"reward": round(a["reward"], 3), "trade_pnl": round(a["trade"], 3),
+                                   "net": round(a["net"], 3),
+                                   "roc_on_budget": round(a["net"] / self.capital, 5) if self.capital > 0 else None}
+        out["best_net"] = max(self.configs, key=lambda c: self._agg(c)["net"]) if self.toks else None
+        return out
 
 
 def run_replay(sim: PaperSim, path: Path):
@@ -312,11 +325,13 @@ def main() -> None:
     g.add_argument("--live", action="store_true", help="stream the live CLOB WebSocket")
     ap.add_argument("--manifest", type=Path, default=None, help="manifest_*.json for token reward params")
     ap.add_argument("--manifest-dir", type=Path, default=None)
-    ap.add_argument("--config", choices=list(CONFIGS), default="clv_full")
+    ap.add_argument("--configs", nargs="+", choices=list(CONFIGS), default=list(CONFIGS),
+                    help="strategies to run in parallel on the same feed (head-to-head). Default: all.")
     ap.add_argument("--size", type=float, default=200.0)
     ap.add_argument("--capital", type=float, default=5000.0,
                     help="total capital budget; quotes top floor(capital/size) markets by pool (0=unlimited)")
-    ap.add_argument("--inv-cap-mult", type=float, default=5.0)
+    ap.add_argument("--inv-cap-mult", type=float, default=1.0,
+                    help="inventory cap per market = mult*size; 1 keeps held position within the budget")
     ap.add_argument("--fill-model", choices=["prorata", "fifo"], default="prorata")
     ap.add_argument("--capture-mult", type=float, default=1.0)
     ap.add_argument("--output-dir", type=Path, default=Path("reports/paper_sim"))
@@ -329,11 +344,11 @@ def main() -> None:
     manifest = args.manifest or (sorted(args.manifest_dir.glob("manifest_*.json"))[-1]
                                  if args.manifest_dir else None)
     token_meta = load_token_meta(manifest)
-    sim = PaperSim(token_meta, args.size, args.inv_cap_mult, args.config,
+    sim = PaperSim(token_meta, args.size, args.inv_cap_mult, args.configs,
                    args.fill_model, args.capture_mult, args.output_dir, args.rotate_minutes,
                    capital=args.capital)
     budget_n = (int(args.capital / args.size) if args.capital > 0 else None)
-    print(f"paper-sim: config={args.config} size={args.size} capital=${args.capital:,.0f} "
+    print(f"paper-sim: configs={args.configs} size={args.size} capital=${args.capital:,.0f} "
           f"-> top {budget_n if budget_n else 'ALL'} markets by pool; "
           f"reward-tokens={sum(1 for m in token_meta.values() if m['pool']>0)}", flush=True)
 
