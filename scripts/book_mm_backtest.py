@@ -88,7 +88,19 @@ def simulate_book_mm(events: list[dict], our_size: float, inventory_cap: float,
                      maker_fee: float = 0.0, mark_delay_s: float = 60.0,
                      improve: bool = False, tick: float = 0.01,
                      signal: float = 0.0, skew_threshold: float = 0.0,
-                     momentum_window: float = 0.0) -> dict[str, Any]:
+                     momentum_window: float = 0.0,
+                     # --- additive predictive components (all default OFF == legacy behavior) ---
+                     debounce_trades: int = 0,
+                     inv_skew: float = 0.0,
+                     vol_window: float = 0.0, vol_spread_coeff: float = 0.0,
+                     tox_threshold: float = 0.0, tox_window: float = 0.0,
+                     tox_cooldown: float = 0.0,
+                     # --- in-band reward accrual (default OFF; needs depth_samples + meta) ---
+                     depth_samples: list | None = None,
+                     reward_pool: float = 0.0, reward_min_size: float = 0.0,
+                     reward_v_cents: float = 0.0,
+                     # --- fill realism (default 'fifo' == legacy) ---
+                     fill_model: str = "fifo", capture_mult: float = 1.0) -> dict[str, Any]:
     """Replay one token's normalized event stream as a passive two-sided MM.
 
     With `skew_threshold` > 0 the MM becomes SIGNAL-INFORMED: it quotes the bid only when the
@@ -98,114 +110,60 @@ def simulate_book_mm(events: list[dict], our_size: float, inventory_cap: float,
     the adverse side.
 
     The forecast is either a fixed `signal`, or — when `momentum_window` > 0 — computed
-    CAUSALLY inside the sim as trailing mid momentum: signal = mid(now) - mid(now - window),
-    using only past mids (the dominant CLV feature). skew_threshold=0 = plain symmetric MM.
-    """
-    from collections import deque
-    use_momentum = momentum_window > 0.0
-    cur_signal = signal
-    want_bid = cur_signal >= -skew_threshold
-    want_ask = cur_signal <= skew_threshold
-    best_bid = best_ask = None
-    our_bid = our_ask = None
-    q_bid_ahead = q_ask_ahead = 0.0
-    inv = cash = fees = gross_spread = 0.0
-    fills: list[tuple[float, int, float]] = []   # (t, dir, mid_at_fill)
-    mids: list[tuple[float, float]] = []
-    mid_hist: deque = deque()
-    n_quote_ev = n_onesided = 0
-    abs_signal_sum = 0.0
-    first_quote_t = last_quote_t = None
+    CAUSALLY inside the sim as trailing reference-price momentum: signal = ref(now) - ref(now -
+    window), using only past prices (the dominant CLV feature). skew_threshold=0 = plain
+    symmetric MM.
 
-    def mid():
-        return (best_bid + best_ask) / 2 if (best_bid is not None and best_ask is not None) else None
+    Optional predictive components (each default-off so the legacy path is byte-identical):
+      * `debounce_trades` > 0 -> the momentum REFERENCE is the size-weighted VWAP of the last
+        `debounce_trades` trades (a debounced mid that strips bid-ask bounce — the actual CLV
+        feature in forward_return_predictability), instead of the raw quote mid.
+      * `inv_skew` -> inventory-aware quoting: shift BOTH quotes by inv_skew*(inv/cap) so when
+        long we lower bid+ask to mean-revert the position (point 4 of the MM checklist).
+      * `vol_window`/`vol_spread_coeff` -> widen both quotes by vol_spread_coeff*recent_vol
+        (stdev of mids over vol_window) when the market is volatile.
+      * `tox_threshold`/`tox_window`/`tox_cooldown` -> reactive toxicity gate: if a fill is
+        followed within tox_window by an adverse mid move > tox_threshold, step off that side
+        for tox_cooldown seconds (informed flow ran us over).
+
+    REWARD: with `depth_samples` (per-minute [t, mid, bb, ba, q_bid_book, q_ask_book] for this
+    token) plus `reward_pool`/`reward_min_size`/`reward_v_cents`, the sim credits Polymarket
+    liquidity reward at each sample from its LIVE quote placement and resting size `our_size`:
+    `reward += (pool/1440) * Q_min(self)/Q_min(self+book)`. This is config- AND size-specific —
+    stepping off a side, quoting below min_size, or skewing away from mid all reduce it.
+
+    FILL MODEL: 'fifo' (default, legacy) fills behind the queue size resting when we joined, then
+    captures ALL subsequent crossing flow at our price — optimistic at large size. 'prorata'
+    instead shares each crossing trade with the live competing depth at our level:
+    our_fill = trade_size * our_size/(our_size + competing_depth) * capture_mult (capped by our
+    size, inventory room). This stops us from assuming we take 100% of flow once front-of-queue;
+    `capture_mult` < 1 is an extra haircut for queue-jumping / latency / partial presence.
+    """
+    from quoter import Quoter  # noqa: PLC0415  (shared streaming state machine — single source of truth)
+    q = Quoter(our_size, inventory_cap, maker_fee=maker_fee, mark_delay_s=mark_delay_s,
+               improve=improve, tick=tick, signal=signal, skew_threshold=skew_threshold,
+               momentum_window=momentum_window, debounce_trades=debounce_trades, inv_skew=inv_skew,
+               vol_window=vol_window, vol_spread_coeff=vol_spread_coeff, tox_threshold=tox_threshold,
+               tox_window=tox_window, tox_cooldown=tox_cooldown, reward_pool=reward_pool,
+               reward_min_size=reward_min_size, reward_v_cents=reward_v_cents,
+               fill_model=fill_model, capture_mult=capture_mult)
+    rw_on = bool(depth_samples) and reward_pool > 0 and reward_v_cents > 0
+    smp = 0
+
+    def credit_due(up_to_t):
+        nonlocal smp
+        while rw_on and smp < len(depth_samples) and depth_samples[smp][0] <= up_to_t:
+            _, s_mid, _, _, q1b, q2b = depth_samples[smp]; smp += 1
+            q.credit_sample(s_mid, q1b, q2b)   # uses pre-event quote state (causal)
 
     for e in events:
+        credit_due(e["t"])
         if e["type"] == "quote":
-            best_bid, best_ask = e["bid"], e["ask"]
-            m = mid()
-            if m is not None:
-                mids.append((e["t"], m))
-                if use_momentum:
-                    mid_hist.append((e["t"], m))
-                    while len(mid_hist) > 1 and mid_hist[0][0] < e["t"] - momentum_window:
-                        mid_hist.popleft()
-                    cur_signal = m - mid_hist[0][1]          # causal trailing momentum
-                    want_bid = cur_signal >= -skew_threshold
-                    want_ask = cur_signal <= skew_threshold
-                    n_quote_ev += 1
-                    abs_signal_sum += abs(cur_signal)
-                    if want_bid != want_ask:
-                        n_onesided += 1
-            if want_bid or want_ask:                      # track time we provide liquidity
-                if first_quote_t is None:
-                    first_quote_t = e["t"]
-                last_quote_t = e["t"]
-            nb = best_bid + tick if improve else best_bid
-            na = best_ask - tick if improve else best_ask
-            if nb >= na:
-                nb, na = best_bid, best_ask
-            if want_bid:
-                if our_bid != nb:
-                    our_bid, q_bid_ahead = nb, (0.0 if improve else e.get("bid_size", 0.0))
-            else:
-                our_bid = None
-            if want_ask:
-                if our_ask != na:
-                    our_ask, q_ask_ahead = na, (0.0 if improve else e.get("ask_size", 0.0))
-            else:
-                our_ask = None
-        else:  # trade
-            m = mid()
-            p, s, side = e["price"], e["size"], e["side"]
-            if side == "SELL" and our_bid is not None and p <= our_bid + 1e-12 and inv < inventory_cap:
-                if q_bid_ahead >= s:
-                    q_bid_ahead -= s
-                else:
-                    fillable = min(our_size, s - q_bid_ahead, inventory_cap - inv)
-                    q_bid_ahead = 0.0
-                    if fillable > 0:
-                        inv += fillable; cash -= fillable * our_bid
-                        fees += maker_fee * fillable * our_bid
-                        if m is not None:
-                            gross_spread += fillable * (m - our_bid)
-                            fills.append((e["t"], +1, m))
-            elif side == "BUY" and our_ask is not None and p >= our_ask - 1e-12 and inv > -inventory_cap:
-                if q_ask_ahead >= s:
-                    q_ask_ahead -= s
-                else:
-                    fillable = min(our_size, s - q_ask_ahead, inventory_cap + inv)
-                    q_ask_ahead = 0.0
-                    if fillable > 0:
-                        inv -= fillable; cash += fillable * our_ask
-                        fees += maker_fee * fillable * our_ask
-                        if m is not None:
-                            gross_spread += fillable * (our_ask - m)
-                            fills.append((e["t"], -1, m))
-
-    m = mid()
-    if inv != 0 and m is not None:
-        half = (best_ask - best_bid) / 2
-        cash += inv * (m - (half if inv > 0 else -half))   # cross to flatten
-        inv = 0.0
-
-    # measured adverse selection: signed mid move against us mark_delay after each fill
-    adverse = 0.0
-    for (t, d, m0) in fills:
-        future = next((mm for (tt, mm) in mids if tt >= t + mark_delay_s), None)
-        if future is None:
-            future = mids[-1][1] if mids else m0
-        adverse += -d * (future - m0) * our_size      # >0 = filled before adverse drift
-    pnl = cash - fees
-    return {
-        "pnl": float(pnl), "gross_spread_captured": float(gross_spread),
-        "adverse_selection": float(adverse), "fees": float(fees),
-        "n_fills": len(fills), "n_quotes": int(sum(1 for e in events if e["type"] == "quote")),
-        "one_sided_quote_frac": (n_onesided / n_quote_ev) if n_quote_ev else 0.0,
-        "mean_abs_signal": (abs_signal_sum / n_quote_ev) if n_quote_ev else 0.0,
-        "quoting_days": ((last_quote_t - first_quote_t) / 86400.0)
-        if (first_quote_t is not None and last_quote_t is not None) else 0.0,
-    }
+            q.on_quote(e["t"], e["bid"], e["ask"], e.get("bid_size", 0.0), e.get("ask_size", 0.0))
+        else:
+            q.on_trade(e["t"], e["price"], e["side"], e["size"])
+    credit_due(float("inf"))
+    return q.finalize()
 
 
 def main() -> None:

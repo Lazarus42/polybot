@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""Shared streaming market-making QUOTER state machine.
+
+This is the SINGLE source of truth for quoting/fill/reward logic, fed an event stream one event
+at a time. The backtest (`book_mm_backtest.simulate_book_mm`) drives it over a captured tape; the
+live paper simulator (`paper_sim.py`) drives it over the real-time WebSocket — so what we
+forward-test is provably the same code we backtested (no drift). The equivalence is locked by the
+existing `tests/test_book_mm.py` suite, which runs entirely through this class.
+
+Causal by construction: every decision uses only past events. See `simulate_book_mm`'s docstring
+for the meaning of each parameter (debounce / inventory skew / vol spread / toxicity gate / fill
+model / reward). Reward is credited via `credit_sample(...)`, called by the driver whenever a
+per-minute book sample is available (replayed from a list in backtest, computed live in paper sim).
+"""
+from __future__ import annotations
+
+import bisect
+from collections import deque
+
+from reward_model import order_score as _osc, q_min as _qm
+
+
+class Quoter:
+    def __init__(self, our_size: float, inventory_cap: float, maker_fee: float = 0.0,
+                 mark_delay_s: float = 60.0, improve: bool = False, tick: float = 0.01,
+                 signal: float = 0.0, skew_threshold: float = 0.0, momentum_window: float = 0.0,
+                 debounce_trades: int = 0, inv_skew: float = 0.0,
+                 vol_window: float = 0.0, vol_spread_coeff: float = 0.0,
+                 tox_threshold: float = 0.0, tox_window: float = 0.0, tox_cooldown: float = 0.0,
+                 reward_pool: float = 0.0, reward_min_size: float = 0.0, reward_v_cents: float = 0.0,
+                 fill_model: str = "fifo", capture_mult: float = 1.0):
+        self.our_size = our_size; self.inventory_cap = inventory_cap
+        self.maker_fee = maker_fee; self.mark_delay_s = mark_delay_s
+        self.improve = improve; self.tick = tick
+        self.skew_threshold = skew_threshold; self.momentum_window = momentum_window
+        self.use_momentum = momentum_window > 0.0
+        self.debounce_trades = debounce_trades; self.inv_skew = inv_skew
+        self.vol_window = vol_window; self.vol_spread_coeff = vol_spread_coeff
+        self.tox_threshold = tox_threshold; self.tox_window = tox_window; self.tox_cooldown = tox_cooldown
+        self.reward_pool = reward_pool; self.reward_min_size = reward_min_size
+        self.reward_v_cents = reward_v_cents; self._per_min = reward_pool / 1440.0
+        self.fill_model = fill_model; self.capture_mult = capture_mult
+        # runtime state
+        self.cur_signal = signal
+        self.want_bid = self.cur_signal >= -skew_threshold
+        self.want_ask = self.cur_signal <= skew_threshold
+        self.best_bid = self.best_ask = None
+        self.our_bid = self.our_ask = None
+        self.q_bid_ahead = self.q_ask_ahead = 0.0
+        self.cur_bid_depth = self.cur_ask_depth = 0.0
+        self.inv = self.cash = self.fees = self.gross_spread = self.reward = 0.0
+        self.fills: list[tuple[float, int, float]] = []
+        self.mids: list[tuple[float, float]] = []
+        self.ref_hist: deque = deque()
+        self.trade_hist: deque = deque()
+        self.vol_hist: deque = deque()
+        self.vol_sum = self.vol_sumsq = 0.0
+        self.n_quotes = self.n_quote_ev = self.n_onesided = 0
+        self.abs_signal_sum = 0.0
+        self.first_quote_t = self.last_quote_t = None
+        self.last_bid_fill = self.last_ask_fill = None
+        self.bid_off_until = self.ask_off_until = -1.0
+
+    def mid(self):
+        return ((self.best_bid + self.best_ask) / 2
+                if (self.best_bid is not None and self.best_ask is not None) else None)
+
+    def _debounced_ref(self, m):
+        if self.debounce_trades <= 0 or not self.trade_hist:
+            return m
+        num = sum(p * s for p, s in self.trade_hist)
+        den = sum(s for _, s in self.trade_hist)
+        return num / den if den > 0 else m
+
+    def _recent_vol(self):
+        n = len(self.vol_hist)
+        if self.vol_window <= 0.0 or n < 2:
+            return 0.0
+        var = (self.vol_sumsq - self.vol_sum * self.vol_sum / n) / (n - 1)
+        return var ** 0.5 if var > 0 else 0.0
+
+    def on_quote(self, t, bid, ask, bid_size=0.0, ask_size=0.0):
+        self.n_quotes += 1
+        self.best_bid, self.best_ask = bid, ask
+        m = self.mid()
+        if m is not None:
+            self.mids.append((t, m))
+            if self.vol_window > 0.0:
+                self.vol_hist.append((t, m)); self.vol_sum += m; self.vol_sumsq += m * m
+                while self.vol_hist and self.vol_hist[0][0] < t - self.vol_window:
+                    _, om = self.vol_hist.popleft(); self.vol_sum -= om; self.vol_sumsq -= om * om
+            if self.use_momentum:
+                ref = self._debounced_ref(m)
+                self.ref_hist.append((t, ref))
+                while len(self.ref_hist) > 1 and self.ref_hist[0][0] < t - self.momentum_window:
+                    self.ref_hist.popleft()
+                self.cur_signal = ref - self.ref_hist[0][1]
+                self.want_bid = self.cur_signal >= -self.skew_threshold
+                self.want_ask = self.cur_signal <= self.skew_threshold
+                self.n_quote_ev += 1
+                self.abs_signal_sum += abs(self.cur_signal)
+                if self.want_bid != self.want_ask:
+                    self.n_onesided += 1
+        if self.tox_threshold > 0.0 and m is not None:
+            if self.last_bid_fill is not None and t - self.last_bid_fill[0] <= self.tox_window \
+                    and m < self.last_bid_fill[1] - self.tox_threshold:
+                self.bid_off_until = t + self.tox_cooldown
+            if self.last_ask_fill is not None and t - self.last_ask_fill[0] <= self.tox_window \
+                    and m > self.last_ask_fill[1] + self.tox_threshold:
+                self.ask_off_until = t + self.tox_cooldown
+        bid_open = self.want_bid and t >= self.bid_off_until
+        ask_open = self.want_ask and t >= self.ask_off_until
+        if bid_open or ask_open:
+            if self.first_quote_t is None:
+                self.first_quote_t = t
+            self.last_quote_t = t
+        nb = self.best_bid + self.tick if self.improve else self.best_bid
+        na = self.best_ask - self.tick if self.improve else self.best_ask
+        if nb >= na:
+            nb, na = self.best_bid, self.best_ask
+        if self.vol_spread_coeff > 0.0:
+            widen = self.vol_spread_coeff * self._recent_vol()
+            nb -= widen; na += widen
+        if self.inv_skew != 0.0 and self.inventory_cap > 0:
+            off = self.inv_skew * (self.inv / self.inventory_cap)
+            nb -= off; na -= off
+        nb = min(max(nb, self.tick), 1.0 - self.tick)
+        na = min(max(na, self.tick), 1.0 - self.tick)
+        if nb >= na:
+            nb, na = self.best_bid, self.best_ask
+        if bid_open:
+            if self.our_bid != nb:
+                self.our_bid, self.q_bid_ahead = nb, (0.0 if self.improve else bid_size or 0.0)
+            self.cur_bid_depth = bid_size or 0.0
+        else:
+            self.our_bid = None
+        if ask_open:
+            if self.our_ask != na:
+                self.our_ask, self.q_ask_ahead = na, (0.0 if self.improve else ask_size or 0.0)
+            self.cur_ask_depth = ask_size or 0.0
+        else:
+            self.our_ask = None
+
+    def on_trade(self, t, price, side, size):
+        m = self.mid()
+        if self.debounce_trades > 0:
+            self.trade_hist.append((price, size))
+            while len(self.trade_hist) > self.debounce_trades:
+                self.trade_hist.popleft()
+        if side == "SELL" and self.our_bid is not None and price <= self.our_bid + 1e-12 \
+                and self.inv < self.inventory_cap:
+            if self.fill_model == "prorata":
+                tot = self.our_size + self.cur_bid_depth
+                share = self.our_size / tot if tot > 0 else 1.0
+                fillable = min(self.our_size, size * share * self.capture_mult, self.inventory_cap - self.inv)
+            elif self.q_bid_ahead >= size:
+                self.q_bid_ahead -= size; fillable = 0.0
+            else:
+                fillable = min(self.our_size, size - self.q_bid_ahead, self.inventory_cap - self.inv)
+                self.q_bid_ahead = 0.0
+            if fillable > 0:
+                self.inv += fillable; self.cash -= fillable * self.our_bid
+                self.fees += self.maker_fee * fillable * self.our_bid
+                if m is not None:
+                    self.gross_spread += fillable * (m - self.our_bid)
+                    self.fills.append((t, +1, m)); self.last_bid_fill = (t, m)
+        elif side == "BUY" and self.our_ask is not None and price >= self.our_ask - 1e-12 \
+                and self.inv > -self.inventory_cap:
+            if self.fill_model == "prorata":
+                tot = self.our_size + self.cur_ask_depth
+                share = self.our_size / tot if tot > 0 else 1.0
+                fillable = min(self.our_size, size * share * self.capture_mult, self.inventory_cap + self.inv)
+            elif self.q_ask_ahead >= size:
+                self.q_ask_ahead -= size; fillable = 0.0
+            else:
+                fillable = min(self.our_size, size - self.q_ask_ahead, self.inventory_cap + self.inv)
+                self.q_ask_ahead = 0.0
+            if fillable > 0:
+                self.inv -= fillable; self.cash += fillable * self.our_ask
+                self.fees += self.maker_fee * fillable * self.our_ask
+                if m is not None:
+                    self.gross_spread += fillable * (self.our_ask - m)
+                    self.fills.append((t, -1, m)); self.last_ask_fill = (t, m)
+
+    def credit_sample(self, s_mid, q_bid_book, q_ask_book):
+        """Accrue one per-minute reward sample from the CURRENT live quote placement."""
+        s_bid = s_ask = 0.0
+        if self.our_bid is not None and self.our_size >= self.reward_min_size:
+            s_bid = _osc(self.reward_v_cents, (s_mid - self.our_bid) * 100.0) * self.our_size
+        if self.our_ask is not None and self.our_size >= self.reward_min_size:
+            s_ask = _osc(self.reward_v_cents, (self.our_ask - s_mid) * 100.0) * self.our_size
+        our_qmin = _qm(s_bid, s_ask, s_mid)
+        tot_qmin = _qm(q_bid_book + s_bid, q_ask_book + s_ask, s_mid)
+        if tot_qmin > 0:
+            self.reward += self._per_min * (our_qmin / tot_qmin)
+
+    def adverse_selection(self):
+        adverse = 0.0
+        mid_ts = [tt for tt, _ in self.mids]
+        for (t, d, m0) in self.fills:
+            i = bisect.bisect_left(mid_ts, t + self.mark_delay_s)
+            future = self.mids[i][1] if i < len(self.mids) else (self.mids[-1][1] if self.mids else m0)
+            adverse += -d * (future - m0) * self.our_size
+        return adverse
+
+    def finalize(self) -> dict:
+        """Flatten residual inventory at mid -/+ half-spread and return the result dict."""
+        m = self.mid()
+        cash = self.cash
+        if self.inv != 0 and m is not None:
+            half = (self.best_ask - self.best_bid) / 2
+            cash += self.inv * (m - (half if self.inv > 0 else -half))
+        pnl = cash - self.fees
+        return {
+            "pnl": float(pnl), "gross_spread_captured": float(self.gross_spread),
+            "adverse_selection": float(self.adverse_selection()), "fees": float(self.fees),
+            "n_fills": len(self.fills), "n_quotes": int(self.n_quotes),
+            "one_sided_quote_frac": (self.n_onesided / self.n_quote_ev) if self.n_quote_ev else 0.0,
+            "mean_abs_signal": (self.abs_signal_sum / self.n_quote_ev) if self.n_quote_ev else 0.0,
+            "quoting_days": ((self.last_quote_t - self.first_quote_t) / 86400.0)
+            if (self.first_quote_t is not None and self.last_quote_t is not None) else 0.0,
+            "reward": float(self.reward),
+        }

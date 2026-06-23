@@ -20,3 +20,17 @@ done
 for m in "$SPOOL"/manifest_*.json; do
     aws s3 cp "$m" "s3://$BUCKET/manifests/$(basename "$m")" --only-show-errors
 done
+
+# paper-sim snapshots (closed *.jsonl.gz) -> paper/dt=YYYY-MM-DD/. Optional; set POLYBOT_PAPER_SPOOL.
+PAPER="${POLYBOT_PAPER_SPOOL:-}"
+if [ -n "$PAPER" ] && [ -d "$PAPER" ]; then
+    for f in "$PAPER"/paper_*.jsonl.gz; do
+        base=$(basename "$f")
+        epoch=$(echo "$base" | sed -E 's/.*_([0-9]+)\.jsonl\.gz$/\1/')
+        dt=$(date -u -d "@$epoch" +%Y-%m-%d 2>/dev/null || date -u -r "$epoch" +%Y-%m-%d)
+        aws s3 mv "$f" "s3://$BUCKET/paper/dt=$dt/$base" --only-show-errors
+    done
+    for s in "$PAPER"/paper_sim_summary.json; do
+        [ -e "$s" ] && aws s3 cp "$s" "s3://$BUCKET/paper/$(basename "$s")" --only-show-errors
+    done
+fi

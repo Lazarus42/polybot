@@ -5,7 +5,7 @@
 # deploy/s3-write-policy.json attached. The S3 bucket must be in the SAME region (free transfer).
 set -euxo pipefail
 
-POLYBOT_BUCKET="YOUR_BUCKET_NAME"
+POLYBOT_BUCKET="polybot-polymarket-sjgibson"
 REPO_URL="https://github.com/Lazarus42/polybot.git"
 # "all" = full-universe sharded fleet (collect_all, needs t3.small/medium);
 # "targeted" = single ~500-token bucketed collector (collect_clob_book, fits t3.micro).

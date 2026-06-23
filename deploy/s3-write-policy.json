@@ -5,13 +5,19 @@
       "Sid": "WriteRawAndManifests",
       "Effect": "Allow",
       "Action": ["s3:PutObject"],
-      "Resource": "arn:aws:s3:::YOUR_BUCKET_NAME/*"
+      "Resource": "arn:aws:s3:::polybot-polymarket-sjgibson/*"
     },
     {
       "Sid": "ListBucket",
       "Effect": "Allow",
       "Action": ["s3:ListBucket"],
-      "Resource": "arn:aws:s3:::YOUR_BUCKET_NAME"
+      "Resource": "arn:aws:s3:::polybot-polymarket-sjgibson"
+    },
+    {
+      "Sid": "PublishHealthAlerts",
+      "Effect": "Allow",
+      "Action": ["sns:Publish"],
+      "Resource": "arn:aws:sns:REGION:ACCOUNT_ID:polybot-alerts"
     }
   ]
 }

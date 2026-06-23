@@ -131,5 +131,152 @@ class TestBookMM(unittest.TestCase):
         self.assertEqual(r["pnl"], 0.0)
 
 
+class TestBookMMAdvanced(unittest.TestCase):
+    def test_new_params_off_match_legacy(self):
+        # all additive components default-off must reproduce the legacy result EXACTLY
+        events = [quote(0, 0.49, 0.51)]
+        t = 1
+        for _ in range(40):
+            events += [trade(t, 0.49, "SELL", 5), quote(t + 0.1, 0.49, 0.51),
+                       trade(t + 0.2, 0.51, "BUY", 5), quote(t + 0.3, 0.49, 0.51)]
+            t += 1
+        legacy = simulate_book_mm(events, 5, 100, mark_delay_s=1.0, momentum_window=5.0,
+                                  skew_threshold=0.003)
+        extended = simulate_book_mm(events, 5, 100, mark_delay_s=1.0, momentum_window=5.0,
+                                    skew_threshold=0.003, debounce_trades=0, inv_skew=0.0,
+                                    vol_window=0.0, vol_spread_coeff=0.0, tox_threshold=0.0)
+        self.assertEqual(legacy, extended)
+
+    def test_debounce_beats_raw_momentum_under_bounce(self):
+        # mid trends UP but the QUOTE mid carries heavy bid-ask bounce; trades are clean.
+        # Raw-mid momentum is fooled by the bounce; debounced (trade-VWAP) momentum tracks the
+        # real trend and quotes bid-only into the rally -> should not do worse than raw momentum.
+        events = []
+        t = 0
+        for i in range(120):
+            base = 0.30 + i * 0.003
+            bounce = 0.02 if i % 2 == 0 else -0.02      # alternating bounce in the quoted mid
+            mid_b = base + bounce
+            events += [quote(t, round(mid_b - 0.01, 4), round(mid_b + 0.01, 4)),
+                       trade(t + 0.1, round(base, 4), "SELL", 5),       # clean trade prints
+                       trade(t + 0.2, round(base + 0.01, 4), "BUY", 5)]
+            t += 1
+        raw = simulate_book_mm(events, 5, 100, mark_delay_s=2.0,
+                               momentum_window=8.0, skew_threshold=0.004)
+        deb = simulate_book_mm(events, 5, 100, mark_delay_s=2.0,
+                               momentum_window=8.0, skew_threshold=0.004, debounce_trades=6)
+        # debouncing strips the bid-ask bounce: the signal is meaningfully steadier than raw...
+        self.assertLess(deb["mean_abs_signal"], raw["mean_abs_signal"])
+        # ...while still detecting the real uptrend (quotes one-sided a non-trivial fraction)
+        self.assertGreater(deb["one_sided_quote_frac"], 0.3)
+
+    def test_inventory_skew_curbs_one_sided_accumulation(self):
+        # persistent SELL flow hits our bid; without skew we keep buying to the cap. With
+        # inventory skew, the bid slides away as we get long -> far fewer one-sided fills.
+        events = [quote(0, 0.49, 0.51)]
+        t = 1
+        for _ in range(30):
+            events += [trade(t, 0.49, "SELL", 5), quote(t + 0.1, 0.49, 0.51)]
+            t += 1
+        noskew = simulate_book_mm(events, 5, 100, inv_skew=0.0)
+        skew = simulate_book_mm(events, 5, 100, inv_skew=0.10)
+        self.assertLess(skew["n_fills"], noskew["n_fills"])
+
+    def test_vol_widening_reduces_fills(self):
+        # volatile mid (large swings inside the vol window); flow prints at the touch. Widening
+        # pushes our quotes off the touch, so the touch-priced trades stop crossing us.
+        events = []
+        t = 0
+        for i in range(40):
+            mid_b = 0.50 + (0.06 if i % 2 == 0 else -0.06)   # high realized vol
+            bb, ba = round(mid_b - 0.01, 4), round(mid_b + 0.01, 4)
+            events += [quote(t, bb, ba), trade(t + 0.1, bb, "SELL", 5),
+                       trade(t + 0.2, ba, "BUY", 5)]
+            t += 1
+        tight = simulate_book_mm(events, 5, 100, vol_window=20.0, vol_spread_coeff=0.0)
+        wide = simulate_book_mm(events, 5, 100, vol_window=20.0, vol_spread_coeff=2.0)
+        self.assertLess(wide["n_fills"], tight["n_fills"])
+
+    def test_toxicity_gate_steps_off_after_adverse_fill(self):
+        # steady up-rally; BUY flow keeps lifting our ask (we sell into the rise = adverse).
+        # The toxicity gate should detect the post-fill adverse move and step off the ask,
+        # cutting the number of adverse sells.
+        events = []
+        t = 0
+        for i in range(60):
+            b = round(0.30 + i * 0.01, 4)
+            events += [quote(t, b, round(b + 0.02, 4)),
+                       trade(t + 0.1, round(b + 0.02, 4), "BUY", 5)]   # lifts our ask
+            t += 1
+        nogate = simulate_book_mm(events, 5, 100, mark_delay_s=2.0,
+                                  tox_threshold=0.0)
+        gated = simulate_book_mm(events, 5, 100, mark_delay_s=2.0,
+                                 tox_threshold=0.005, tox_window=5.0, tox_cooldown=5.0)
+        self.assertLess(gated["n_fills"], nogate["n_fills"])
+        self.assertGreater(gated["pnl"], nogate["pnl"])   # fewer adverse sells -> less loss
+
+
+class TestFillModel(unittest.TestCase):
+    def test_prorata_fills_where_fifo_queue_blocks(self):
+        # 900 resting ahead, a single 500 trade: FIFO never reaches us; prorata still gets a share
+        events = [quote(0, 0.49, 0.51, bs=900, asz=900), trade(1, 0.49, "SELL", 500)]
+        fifo = simulate_book_mm(events, our_size=100, inventory_cap=1000, fill_model="fifo")
+        pro = simulate_book_mm(events, our_size=100, inventory_cap=1000, fill_model="prorata")
+        self.assertEqual(fifo["n_fills"], 0)
+        self.assertEqual(pro["n_fills"], 1)        # share = 100/(100+900)=0.1 -> 50 lots
+
+    def test_prorata_capture_mult_haircut(self):
+        # round-trip flow; capture_mult halves the filled volume -> ~half the pnl
+        events = [quote(0, 0.49, 0.51, bs=100, asz=100)]
+        t = 1
+        for _ in range(40):
+            events += [trade(t, 0.49, "SELL", 100), quote(t + 0.1, 0.49, 0.51, bs=100, asz=100),
+                       trade(t + 0.2, 0.51, "BUY", 100), quote(t + 0.3, 0.49, 0.51, bs=100, asz=100)]
+            t += 1
+        full = simulate_book_mm(events, 100, 1000, mark_delay_s=0.0, fill_model="prorata", capture_mult=1.0)
+        half = simulate_book_mm(events, 100, 1000, mark_delay_s=0.0, fill_model="prorata", capture_mult=0.5)
+        self.assertGreater(full["pnl"], 0.0)
+        self.assertGreater(half["pnl"], 0.0)
+        self.assertGreater(full["pnl"], half["pnl"])
+
+    def test_prorata_share_grows_when_we_are_larger(self):
+        # same flow, deeper our_size relative to competing depth -> bigger fill -> more spread
+        events = [quote(0, 0.49, 0.51, bs=200, asz=200), trade(1, 0.49, "SELL", 1000)]
+        small = simulate_book_mm(events, 100, 100000, fill_model="prorata")
+        big = simulate_book_mm(events, 800, 100000, fill_model="prorata")
+        self.assertGreater(big["gross_spread_captured"], small["gross_spread_captured"])
+
+
+class TestRewardAccrual(unittest.TestCase):
+    # depth sample format: [t, mid, bb, ba, q_bid_book, q_ask_book]
+    SAMPLES = [[0.5, 0.50, 0.49, 0.51, 444.0, 444.0],
+               [1.5, 0.50, 0.49, 0.51, 444.0, 444.0],
+               [2.5, 0.50, 0.49, 0.51, 444.0, 444.0]]
+    QUOTES = [quote(0, 0.49, 0.51), quote(1, 0.49, 0.51), quote(2, 0.49, 0.51)]
+
+    def _run(self, size, **kw):
+        return simulate_book_mm(self.QUOTES, our_size=size, inventory_cap=1000,
+                                depth_samples=self.SAMPLES, reward_pool=1440.0,
+                                reward_min_size=200.0, reward_v_cents=3.0, **kw)
+
+    def test_reward_off_by_default(self):
+        r = simulate_book_mm(self.QUOTES, 1000, 1000)   # no depth_samples
+        self.assertEqual(r["reward"], 0.0)
+
+    def test_below_min_size_earns_no_reward(self):
+        self.assertEqual(self._run(20)["reward"], 0.0)        # 20 < min_size 200
+
+    def test_two_sided_earns_reward(self):
+        r = self._run(1000)
+        # capture ~0.5/sample (our ~444.4 vs book 444), per_min = 1440/1440 = 1, 3 samples -> ~1.5
+        self.assertAlmostEqual(r["reward"], 1.5, places=2)
+
+    def test_stepping_off_reduces_reward(self):
+        both = self._run(1000)                                 # neutral two-sided
+        one_sided = self._run(1000, signal=1.0, skew_threshold=0.5)  # ask stepped off
+        self.assertLess(one_sided["reward"], both["reward"])
+        self.assertGreater(one_sided["reward"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

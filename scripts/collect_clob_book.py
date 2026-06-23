@@ -179,12 +179,17 @@ def _event_meta(ev: dict) -> dict:
 
 def select_target_event_records(events: list[dict], n_events: int = 30, min_liquidity: float = 5000.0,
                                 exclude_crypto: bool = True, max_markets_per_event: int = 15,
-                                one_token_per_market: bool = True, longshot_max_price: float = 0.08) -> list[dict]:
+                                one_token_per_market: bool = True, longshot_max_price: float = 0.08,
+                                incentive_categories: set | None = None) -> list[dict]:
     """Select whole EVENTS in strategy-aligned buckets (rewards/liquid/volatile/basket/longshot)
     so the capture serves every strategy. Per event we keep the most-liquid
     `max_markets_per_event` markets PLUS any cheap 'longshot' legs (price <= `longshot_max_price`),
     so 128-candidate giants don't eat the token budget but the penny tails are still captured for
-    longshot strategies. One token per market by default (YES/NO mirror). Pure / tested."""
+    longshot strategies. One token per market by default (YES/NO mirror). Pure / tested.
+
+    If `incentive_categories` is given (e.g. {"sports","esports","nba","soccer"}), the selection
+    is REPLACED by a single 'incentive' bucket: only reward-bearing events whose tags/category
+    intersect that set, ranked by total daily reward pool (the targeted maker-rewards capture)."""
     cand = []
     for ev in events:
         if _event_excluded(ev, exclude_crypto):
@@ -200,7 +205,7 @@ def select_target_event_records(events: list[dict], n_events: int = 30, min_liqu
                 ids.add(mid); chosen.append(m)
         toks: list[str] = []
         token_meta: dict[str, dict] = {}
-        liq = move = 0.0
+        liq = move = reward_est = 0.0
         n_reward = 0
         for m in chosen:
             mt = _market_tokens(m)
@@ -212,12 +217,21 @@ def select_target_event_records(events: list[dict], n_events: int = 30, min_liqu
             liq += _num(m.get("liquidityNum") or m.get("liquidity"))
             move = max(move, abs(_num(m.get("oneDayPriceChange"))))
             n_reward += _market_has_rewards(m)
+            reward_est += rp["reward_daily_est"]
         if not toks or liq < min_liquidity:
             continue
+        ev_tags = {t.get("slug", "") for t in (ev.get("tags") or []) if isinstance(t, dict)}
         cand.append({"slug": ev.get("slug", ""), "title": ev.get("title", ""),
                      "tokens": toks, "token_meta": token_meta, "liq": round(liq),
                      "move": round(move, 4), "n_live": len(chosen), "n_longshot": len(cheap),
-                     "rewards": n_reward > 0, **_event_meta(ev)})
+                     "rewards": n_reward > 0, "reward_est": round(reward_est, 1),
+                     "tags": sorted(ev_tags), **_event_meta(ev)})
+    # targeted maker-rewards mode: only reward events in the requested categories, by pool size
+    if incentive_categories:
+        inc = [c for c in cand if c["rewards"]
+               and (set(c["tags"]) & incentive_categories or c["category"] in incentive_categories)]
+        inc.sort(key=lambda c: c["reward_est"], reverse=True)
+        return [{**c, "bucket": "incentive"} for c in inc[:n_events]]
     # strategy-aligned buckets
     by_reward = sorted([c for c in cand if c["rewards"]], key=lambda c: c["liq"], reverse=True)
     by_liq = sorted(cand, key=lambda c: c["liq"], reverse=True)
@@ -242,10 +256,12 @@ def select_target_event_records(events: list[dict], n_events: int = 30, min_liqu
 
 
 def select_target_events(events: list[dict], n_events: int = 30, min_liquidity: float = 5000.0,
-                         exclude_crypto: bool = True, max_tokens: int = 200) -> list[str]:
+                         exclude_crypto: bool = True, max_tokens: int = 200,
+                         incentive_categories: set | None = None) -> list[str]:
     """Token-id union of the selected events (deduped, capped). Pure / unit-tested."""
     tokens: list[str] = []
-    for c in select_target_event_records(events, n_events, min_liquidity, exclude_crypto):
+    for c in select_target_event_records(events, n_events, min_liquidity, exclude_crypto,
+                                         incentive_categories=incentive_categories):
         tokens.extend(c["tokens"])
     return list(dict.fromkeys(tokens))[:max_tokens]
 
@@ -279,7 +295,8 @@ def all_tokens_from_events(events: list[dict], min_liquidity: float = 1000.0,
 
 
 def discover_target_records(n_events: int, min_liquidity: float = 5000.0, exclude_crypto: bool = True,
-                            max_markets_per_event: int = 15, one_token_per_market: bool = True) -> list[dict]:
+                            max_markets_per_event: int = 15, one_token_per_market: bool = True,
+                            incentive_categories: set | None = None) -> list[dict]:
     """Fetch active EVENTS and return the selected event records (with slug/title)."""
     import requests  # noqa: PLC0415
 
@@ -289,7 +306,8 @@ def discover_target_records(n_events: int, min_liquidity: float = 5000.0, exclud
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     return select_target_event_records(r.json(), n_events, min_liquidity, exclude_crypto,
-                                       max_markets_per_event, one_token_per_market)
+                                       max_markets_per_event, one_token_per_market,
+                                       incentive_categories=incentive_categories)
 
 
 def resolved_asset_ids(payload) -> list[str]:
@@ -487,7 +505,13 @@ def main() -> None:
                     help="This shard writes its live subscribed token set here for the fleet launcher.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print the selected events (slug/title/bucket) and exit — verify before capturing.")
+    ap.add_argument("--incentive-categories", type=str, default=None,
+                    help="Comma-separated tags (e.g. 'sports,esports,nba,soccer') -> capture ONLY "
+                         "reward-bearing events in those categories, ranked by daily reward pool.")
     args = ap.parse_args()
+
+    incentive = ({c.strip().lower() for c in args.incentive_categories.split(",") if c.strip()}
+                 if args.incentive_categories else None)
 
     records: list[dict] = []
     tokens = list(args.tokens)
@@ -497,7 +521,8 @@ def main() -> None:
         records = discover_target_records(args.discover, args.min_liquidity,
                                           exclude_crypto=not args.include_crypto,
                                           max_markets_per_event=args.max_markets_per_event,
-                                          one_token_per_market=not args.both_tokens)
+                                          one_token_per_market=not args.both_tokens,
+                                          incentive_categories=incentive)
         for c in records:
             tokens.extend(c["tokens"])
     tokens = list(dict.fromkeys(tokens))
@@ -506,12 +531,14 @@ def main() -> None:
 
     if args.dry_run:
         print(f"{len(records)} events selected, {len(tokens)} tokens (capped {args.max_tokens}):\n")
-        for c in sorted(records, key=lambda x: x["bucket"]):
+        for c in sorted(records, key=lambda x: (x["bucket"], -x.get("reward_est", 0))):
             flags = ("R" if c.get("rewards") else "-") + ("N" if c.get("neg_risk") else "-")
             hz = c.get("horizon_days")
-            print(f"  [{c['bucket']:8}] {flags} {c.get('category','?'):10} "
-                  f"liq=${c['liq']:>9,} move={c['move']:.3f} n={c['n_live']} "
-                  f"hz={hz if hz is not None else '?':>5}d  {c['slug'][:48]}")
+            print(f"  [{c['bucket']:9}] {flags} {c.get('category','?'):10} "
+                  f"pool=${c.get('reward_est',0):>8,.0f}/d liq=${c['liq']:>9,} "
+                  f"n={c['n_live']} hz={hz if hz is not None else '?':>5}d  {c['slug'][:42]}")
+        total_pool = sum(c.get("reward_est", 0) for c in records)
+        print(f"\nTOTAL daily reward pool across selected events: ${total_pool:,.0f}/day")
         from collections import Counter
         print("\nby category:", dict(Counter(c.get("category", "?") for c in records)))
         print("by bucket:", dict(Counter(c.get("bucket", "?") for c in records)))
@@ -532,8 +559,9 @@ def main() -> None:
         manifest = {"created": stamp, "n_tokens": len(tokens), "tokens": tokens,
                     "token_meta": token_meta,
                     "events": [{k: c.get(k) for k in ("bucket", "slug", "title", "category", "rewards",
-                                                      "neg_risk", "horizon_days", "competitive", "liq",
-                                                      "move", "n_live", "n_longshot", "tokens")}
+                                                      "reward_est", "neg_risk", "horizon_days",
+                                                      "competitive", "liq", "move", "n_live",
+                                                      "n_longshot", "tokens")}
                                for c in records]}
         manifest_path = args.output_dir / f"manifest_{stamp}.json"
         manifest_path.write_text(json.dumps(manifest, indent=2))
@@ -546,7 +574,8 @@ def main() -> None:
         return discover_target_records(args.discover, args.min_liquidity,
                                        exclude_crypto=not args.include_crypto,
                                        max_markets_per_event=args.max_markets_per_event,
-                                       one_token_per_market=not args.both_tokens)
+                                       one_token_per_market=not args.both_tokens,
+                                       incentive_categories=incentive)
 
     run_collector(tokens, args.output_dir, args.minutes, args.rotate_minutes,
                   args.rediscover_minutes, rediscover_fn=(rediscover if args.discover else None),

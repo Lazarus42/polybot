@@ -1,0 +1,24 @@
+[Unit]
+Description=Polymarket paper market-making simulator (live, virtual orders -> S3 snapshots)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/polymarket_exp
+Environment=PYTHONUNBUFFERED=1
+# Streams the live CLOB book, runs the SAME Quoter as the backtest (no drift), and lands
+# per-minute virtual-quote/fill/reward snapshots (gzip, rotated 15 min) for the S3 uploader.
+# Quotes the reward-eligible tokens from the latest manifest the collector wrote. Places NO real
+# orders. --minutes huge so it runs forever under systemd; restart on crash.
+ExecStart=/home/ec2-user/polymarket_exp/.venv/bin/python scripts/paper_sim.py \
+    --live --config clv_full --size 200 --capital 5000 --fill-model prorata \
+    --manifest-dir /home/ec2-user/polymarket_exp/reports/clob_capture \
+    --minutes 1000000000 --rotate-minutes 15 \
+    --output-dir /home/ec2-user/polymarket_exp/reports/paper_sim
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

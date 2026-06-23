@@ -76,6 +76,34 @@ ls -lh /home/ec2-user/polymarket_exp/reports/clob_capture/   # local spool (shou
 Tunables are in `polybot-collector.service` (`--discover`, `--max-tokens`, `--rotate-minutes`,
 `--rediscover-minutes`); `systemctl restart polybot-collector` after editing.
 
+## Paper trading (live forward-test)
+
+`paper_sim.py` runs the SAME `Quoter` as the backtest against the live book — no real orders — and
+lands per-minute virtual quote/fill/reward snapshots to S3, so you can watch how the strategy would
+actually do on fresh data. It enforces a **capital budget** (default `--capital 5000`, size 200 →
+top 25 reward markets by pool), matching a real $5k book.
+
+**One command** (on the already-bootstrapped collector box, as root):
+
+```bash
+sudo bash /home/ec2-user/polymarket_exp/deploy/setup_paper_sim.sh
+```
+
+That pulls latest code, starts the `polybot-paper-sim` systemd service, and adds the paper spool to
+the uploader cron. Snapshots ship to `s3://BUCKET/paper/dt=YYYY-MM-DD/paper_<host>_<epoch>.jsonl.gz`
+every 15 min (plus `paper/paper_sim_summary.json`). Operate it like the collector:
+
+```bash
+journalctl -u polybot-paper-sim -f                       # virtual quoting/fills/reward
+aws s3 ls s3://BUCKET/paper/ --recursive | tail
+```
+
+Tunables in `polybot-paper-sim.service`: `--capital`, `--size`, `--config` (clv_full|neutral),
+`--fill-model`. It quotes the reward-eligible markets from the collector's latest manifest. Caveats:
+paper orders aren't in the book, so modeled reward assumes our presence doesn't dilute the pool and
+no *actual* payout accrues — confirm the load-bearing reward-share assumption later with a small
+real-capital deployment and `paper_sim.reconcile_rewards()` against the Markets API.
+
 ## Pulling data back for analysis
 
 ```bash

@@ -133,6 +133,34 @@ class TestCollectAll(unittest.TestCase):
         self.assertEqual([len(x) for x in s], [450, 450, 100])
 
 
+class TestIncentiveMode(unittest.TestCase):
+    def _rmkt(self, slug, toks, pool, liq=1e5):
+        m = mk(slug, liq, toks=toks, mid=slug)
+        m["rewardsMaxSpread"] = 3.0
+        m["clobRewards"] = [{"rewardsDailyRate": pool}]
+        return m
+
+    def test_incentive_keeps_only_sports_rewards_ranked_by_pool(self):
+        from collect_clob_book import select_target_event_records
+        nba = ev("nba-lakers", [self._rmkt("nba", ("NBA1", "NBA2"), 7700)],
+                 title="Lakers win?", tags=["sports", "nba"])
+        soccer = ev("epl-game", [self._rmkt("epl", ("EPL1", "EPL2"), 10000)],
+                    title="EPL", tags=["sports", "soccer"])
+        politics = ev("senate", [self._rmkt("sen", ("SEN1", "SEN2"), 99999)],
+                      title="Senate", tags=["politics"])           # rich but wrong category
+        sports_norew = ev("nfl-noreward", [mk("nfl", 1e5, toks=("NFL1", "NFL2"), mid="nfl")],
+                          title="NFL", tags=["sports", "nfl"])     # sports but no rewards
+        recs = select_target_event_records([nba, soccer, politics, sports_norew],
+                                           n_events=10, min_liquidity=5000,
+                                           incentive_categories={"sports"})
+        slugs = [r["slug"] for r in recs]
+        self.assertEqual(slugs, ["epl-game", "nba-lakers"])   # only sports+rewards, by pool desc
+        self.assertEqual(recs[0]["bucket"], "incentive")
+        self.assertAlmostEqual(recs[0]["reward_est"], 10000.0)
+        self.assertNotIn("senate", slugs)        # wrong category dropped
+        self.assertNotIn("nfl-noreward", slugs)  # no rewards dropped
+
+
 class TestRediscovery(unittest.TestCase):
     def test_tokens_to_add_only_new(self):
         current = {"a", "b"}
