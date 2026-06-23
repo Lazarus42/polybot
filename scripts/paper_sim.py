@@ -190,9 +190,12 @@ class PaperSim:
         qs = [self.q[(cfg, t)] for t in self.toks]
         reward = sum(q.reward for q in qs)
         trade = sum(q.cash - q.fees + (q.inv * q.mids[-1][1] if q.mids else 0.0) for q in qs)
+        # cost to flatten the CURRENT inventory now (|inv| * half-spread) — continuous, not lumpy
+        liq = sum(abs(q.inv) * (q.best_ask - q.best_bid) / 2
+                  for q in qs if q.best_bid is not None and q.best_ask is not None)
         return {"reward": reward, "trade": trade, "net": reward + trade,
-                "fills": sum(len(q.fills) for q in qs),
-                "inv": sum(abs(q.inv) for q in qs),
+                "fills": sum(len(q.fills) for q in qs), "inv": sum(abs(q.inv) for q in qs),
+                "liq_now": liq, "net_if_flat": reward + trade - liq,
                 "flat_cost": sum(q.flat_cost for q in qs), "n_flat": sum(q.n_flats for q in qs)}
 
     def heartbeat(self) -> str:
@@ -200,9 +203,10 @@ class PaperSim:
         lines = [head]
         for c in self.configs:                       # one line per strategy — head-to-head
             a = self._agg(c)
-            lines.append(f"   {c:13} reward=${a['reward']:.4f} net=${a['net']:.4f} "
-                         f"fills={a['fills']} |inv|={a['inv']:.0f} "
-                         f"flat_cost=${a['flat_cost']:.4f}({a['n_flat']})")
+            # net_if_flat = what you'd keep liquidating now; liq = exit cost of current inventory;
+            # flat = spread already paid on forced exits
+            lines.append(f"   {c:13} reward=${a['reward']:.4f} net_if_flat=${a['net_if_flat']:.4f} "
+                         f"|inv|={a['inv']:.0f} liq=${a['liq_now']:.4f} flat=${a['flat_cost']:.4f}({a['n_flat']})")
         return "\n".join(lines)
 
     def process_message(self, payload):
@@ -269,9 +273,10 @@ class PaperSim:
         for c in self.configs:
             a = self._agg(c)
             out["by_config"][c] = {"reward": round(a["reward"], 3), "trade_pnl": round(a["trade"], 3),
-                                   "net": round(a["net"], 3), "flatten_cost": round(a["flat_cost"], 3),
-                                   "n_flatten": a["n_flat"],
-                                   "roc_on_budget": round(a["net"] / self.capital, 5) if self.capital > 0 else None}
+                                   "net": round(a["net"], 3), "liq_now": round(a["liq_now"], 3),
+                                   "net_if_flat": round(a["net_if_flat"], 3),
+                                   "flatten_cost": round(a["flat_cost"], 3), "n_flatten": a["n_flat"],
+                                   "roc_on_budget": round(a["net_if_flat"] / self.capital, 5) if self.capital > 0 else None}
         out["best_net"] = max(self.configs, key=lambda c: self._agg(c)["net"]) if self.toks else None
         return out
 
