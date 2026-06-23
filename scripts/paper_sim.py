@@ -158,21 +158,28 @@ class PaperSim:
         q.credit_sample(mid, q1, q2)
         self.last_sample[tok] = t
         marked = q.cash + q.inv * mid - q.fees
-        self._writer(t).write(json.dumps({
+        w = self._writer(t)
+        w.write(json.dumps({
             "t": round(t, 1), "token": tok, "config": self.config, "size": self.size,
             "mid": round(mid, 4), "our_bid": q.our_bid, "our_ask": q.our_ask,
             "inv": round(q.inv, 2), "marked_pnl": round(marked, 4),
             "reward_cum": round(q.reward, 4), "reward_step": round(q.reward - rw_before, 5),
             "q_bid_book": round(q1, 1), "q_ask_book": round(q2, 1), "n_fills": len(q.fills),
         }) + "\n")
+        w.flush()                 # flush gzip buffer to disk so the .tmp is readable + crash-durable
         self.n_snapshots += 1
 
     def heartbeat(self) -> str:
         fills = sum(len(q.fills) for q in self.q.values())
         reward = sum(q.reward for q in self.q.values())
         quoting = sum(1 for q in self.q.values() if q.our_bid is not None or q.our_ask is not None)
+        # trading P&L = cash from fills - fees + inventory marked at the live mid (adverse shows here)
+        trade_pnl = sum(q.cash - q.fees + (q.inv * q.mids[-1][1] if q.mids else 0.0)
+                        for q in self.q.values())
+        inv = sum(abs(q.inv) for q in self.q.values())
         return (f"[hb] msgs={self.msgs_in} markets={len(self.q)} quoting_now={quoting} "
-                f"snapshots={self.n_snapshots} fills={fills} reward=${reward:.2f}")
+                f"snapshots={self.n_snapshots} fills={fills} reward=${reward:.4f} "
+                f"trade_pnl=${trade_pnl:.4f} net=${reward + trade_pnl:.4f} |inv|={inv:.2f}")
 
     def process_message(self, payload):
         """Handle one collector WS payload (book / price_change / last_trade_price). Idempotent."""
@@ -329,6 +336,16 @@ def main() -> None:
     print(f"paper-sim: config={args.config} size={args.size} capital=${args.capital:,.0f} "
           f"-> top {budget_n if budget_n else 'ALL'} markets by pool; "
           f"reward-tokens={sum(1 for m in token_meta.values() if m['pool']>0)}", flush=True)
+
+    # close the spool cleanly on systemd stop/restart (rename .tmp -> .jsonl.gz so it ships, not lost)
+    import signal  # noqa: PLC0415
+
+    def _shutdown(*_):
+        sim.close()
+        (args.output_dir / "paper_sim_summary.json").write_text(json.dumps(sim.summary(), indent=2) + "\n")
+        os._exit(0)
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
 
     if args.replay:
         run_replay(sim, args.replay)
