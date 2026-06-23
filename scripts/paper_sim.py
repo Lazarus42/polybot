@@ -79,11 +79,14 @@ class PaperSim:
 
     def __init__(self, token_meta: dict, size: float, inv_cap_mult: float, configs: list[str],
                  fill_model: str, capture_mult: float, out_dir: Path, rotate_minutes: float,
-                 capital: float = 0.0):
+                 capital: float = 0.0, max_capture_share: float = 1.0,
+                 quote_latency: float = 0.0, cancel_on_move: float = 0.0):
         self.meta = token_meta
         self.size = size; self.configs = configs
         self.kw = {c: dict(CONFIGS[c]) for c in configs}   # all configs run in parallel, same feed
         self.fill_model = fill_model; self.capture_mult = capture_mult
+        self.max_capture_share = max_capture_share
+        self.quote_latency = quote_latency; self.cancel_on_move = cancel_on_move
         self.inv_cap = size * inv_cap_mult
         # CAPITAL BUDGET: two-sided resting collateral is ~$1*size per market, so a fixed budget
         # funds floor(capital/size) markets — we quote the top-N by reward pool (the targetable
@@ -119,7 +122,9 @@ class PaperSim:
                 self.q[(c, tok)] = Quoter(self.size, self.inv_cap, fill_model=self.fill_model,
                                           capture_mult=self.capture_mult, reward_pool=m["pool"],
                                           reward_min_size=m["min_size"], reward_v_cents=m["v_cents"],
-                                          **self.kw[c])
+                                          max_capture_share=self.max_capture_share,
+                                          quote_latency=self.quote_latency,
+                                          cancel_on_move=self.cancel_on_move, **self.kw[c])
             self.toks.add(tok)
         return True
 
@@ -334,6 +339,12 @@ def main() -> None:
                     help="inventory cap per market = mult*size; 1 keeps held position within the budget")
     ap.add_argument("--fill-model", choices=["prorata", "fifo"], default="prorata")
     ap.add_argument("--capture-mult", type=float, default=1.0)
+    ap.add_argument("--max-capture-share", type=float, default=0.10,
+                    help="cap modeled reward share per market (competition fills in; 1.0=uncapped)")
+    ap.add_argument("--quote-latency", type=float, default=0.2,
+                    help="seconds our live quote lags the book (stale-order pickoff risk); 0=instant")
+    ap.add_argument("--cancel-on-move", type=float, default=0.01,
+                    help="cancel a resting quote when mid drifts more than this (price units); 0=off")
     ap.add_argument("--output-dir", type=Path, default=Path("reports/paper_sim"))
     ap.add_argument("--rotate-minutes", type=float, default=15.0)
     ap.add_argument("--minutes", type=float, default=240.0, help="live run duration")
@@ -346,7 +357,8 @@ def main() -> None:
     token_meta = load_token_meta(manifest)
     sim = PaperSim(token_meta, args.size, args.inv_cap_mult, args.configs,
                    args.fill_model, args.capture_mult, args.output_dir, args.rotate_minutes,
-                   capital=args.capital)
+                   capital=args.capital, max_capture_share=args.max_capture_share,
+                   quote_latency=args.quote_latency, cancel_on_move=args.cancel_on_move)
     budget_n = (int(args.capital / args.size) if args.capital > 0 else None)
     print(f"paper-sim: configs={args.configs} size={args.size} capital=${args.capital:,.0f} "
           f"-> top {budget_n if budget_n else 'ALL'} markets by pool; "

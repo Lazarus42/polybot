@@ -278,5 +278,43 @@ class TestRewardAccrual(unittest.TestCase):
         self.assertGreater(one_sided["reward"], 0.0)
 
 
+class TestCaptureShareCap(unittest.TestCase):
+    def test_share_capped(self):
+        from quoter import Quoter
+        # empty competing book -> our share would be 100%; cap to 10%
+        q = Quoter(our_size=1000, inventory_cap=10000, reward_pool=1440.0,
+                   reward_min_size=100.0, reward_v_cents=3.0, max_capture_share=0.10)
+        q.on_quote(0.0, 0.49, 0.51, 100, 100)
+        q.credit_sample(0.50, 0.0, 0.0)        # per_min=1, raw share=1.0 -> capped 0.10
+        self.assertAlmostEqual(q.reward, 0.10, places=4)
+
+    def test_uncapped_default(self):
+        from quoter import Quoter
+        q = Quoter(our_size=1000, inventory_cap=10000, reward_pool=1440.0,
+                   reward_min_size=100.0, reward_v_cents=3.0)   # default max_capture_share=1.0
+        q.on_quote(0.0, 0.49, 0.51, 100, 100)
+        q.credit_sample(0.50, 0.0, 0.0)
+        self.assertAlmostEqual(q.reward, 1.0, places=4)         # full share, no cap
+
+
+class TestLatencyPickoff(unittest.TestCase):
+    def _run(self, latency, cancel=0.0):
+        from quoter import Quoter
+        q = Quoter(our_size=100, inventory_cap=1000, fill_model="prorata",
+                   quote_latency=latency, cancel_on_move=cancel)
+        q.on_quote(0.0, 0.49, 0.51, 0, 0)        # rest bid 0.49 (mid 0.50)
+        q.on_quote(2.0, 0.44, 0.46, 0, 0)        # market drops to mid 0.45
+        q.on_trade(2.2, 0.49, "SELL", 100)       # informed sell hits 0.49 in the latency window
+        return q
+
+    def test_latency_causes_pickoff(self):
+        self.assertEqual(len(self._run(0.0).fills), 0)   # fast: already re-quoted to 0.44, no fill
+        self.assertEqual(len(self._run(0.5).fills), 1)   # slow: filled at the stale 0.49 (picked off)
+
+    def test_cancel_on_move_defends(self):
+        # same 0.5s latency, but cancel-on-move yanks the stale quote when mid drifts > 2c
+        self.assertEqual(len(self._run(0.5, cancel=0.02).fills), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

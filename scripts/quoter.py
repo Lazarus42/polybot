@@ -28,7 +28,8 @@ class Quoter:
                  vol_window: float = 0.0, vol_spread_coeff: float = 0.0,
                  tox_threshold: float = 0.0, tox_window: float = 0.0, tox_cooldown: float = 0.0,
                  reward_pool: float = 0.0, reward_min_size: float = 0.0, reward_v_cents: float = 0.0,
-                 fill_model: str = "fifo", capture_mult: float = 1.0):
+                 fill_model: str = "fifo", capture_mult: float = 1.0, max_capture_share: float = 1.0,
+                 quote_latency: float = 0.0, cancel_on_move: float = 0.0):
         self.our_size = our_size; self.inventory_cap = inventory_cap
         self.maker_fee = maker_fee; self.mark_delay_s = mark_delay_s
         self.improve = improve; self.tick = tick
@@ -40,6 +41,11 @@ class Quoter:
         self.reward_pool = reward_pool; self.reward_min_size = reward_min_size
         self.reward_v_cents = reward_v_cents; self._per_min = reward_pool / 1440.0
         self.fill_model = fill_model; self.capture_mult = capture_mult
+        self.max_capture_share = max_capture_share   # cap modeled reward share (competition fills in)
+        # latency model: our LIVE quote lags the DESIRED quote by quote_latency seconds (so fast
+        # flow can pick off a stale order); cancel_on_move>0 instantly pulls the live quote when the
+        # mid has moved more than that from where the quote was set (the fast cancel-on-move defense).
+        self.quote_latency = quote_latency; self.cancel_on_move = cancel_on_move
         # runtime state
         self.cur_signal = signal
         self.want_bid = self.cur_signal >= -skew_threshold
@@ -60,6 +66,8 @@ class Quoter:
         self.first_quote_t = self.last_quote_t = None
         self.last_bid_fill = self.last_ask_fill = None
         self.bid_off_until = self.ask_off_until = -1.0
+        self.desired: deque = deque()    # (t, bid, ask, bid_size, ask_size, mid) pending quotes
+        self.live_mid = None             # mid when the current LIVE quote was set (for cancel-on-move)
 
     def mid(self):
         return ((self.best_bid + self.best_ask) / 2
@@ -128,20 +136,41 @@ class Quoter:
         na = min(max(na, self.tick), 1.0 - self.tick)
         if nb >= na:
             nb, na = self.best_bid, self.best_ask
-        if bid_open:
-            if self.our_bid != nb:
-                self.our_bid, self.q_bid_ahead = nb, (0.0 if self.improve else bid_size or 0.0)
-            self.cur_bid_depth = bid_size or 0.0
+        # the quote we WANT now (becomes live after quote_latency seconds)
+        des_bid = nb if bid_open else None
+        des_ask = na if ask_open else None
+        self.desired.append((t, des_bid, des_ask, bid_size or 0.0, ask_size or 0.0, m))
+        self._promote(t)
+        # fast cancel-on-move: yank a now-stale live quote the instant the mid has drifted past
+        # the threshold from where it was set (cancels are ~free/instant; re-quoting still lags).
+        if self.cancel_on_move > 0.0 and m is not None and self.live_mid is not None \
+                and abs(m - self.live_mid) > self.cancel_on_move:
+            self.our_bid = self.our_ask = None
+
+    def _promote(self, t):
+        """Apply the most recent DESIRED quote that is now older than quote_latency -> LIVE."""
+        applied = None
+        while self.desired and self.desired[0][0] <= t - self.quote_latency:
+            applied = self.desired.popleft()
+        if applied is None:
+            return
+        _, db, da, dbs, das, dmid = applied
+        if db is not None:
+            if self.our_bid != db:
+                self.our_bid, self.q_bid_ahead = db, (0.0 if self.improve else dbs)
+            self.cur_bid_depth = dbs
         else:
             self.our_bid = None
-        if ask_open:
-            if self.our_ask != na:
-                self.our_ask, self.q_ask_ahead = na, (0.0 if self.improve else ask_size or 0.0)
-            self.cur_ask_depth = ask_size or 0.0
+        if da is not None:
+            if self.our_ask != da:
+                self.our_ask, self.q_ask_ahead = da, (0.0 if self.improve else das)
+            self.cur_ask_depth = das
         else:
             self.our_ask = None
+        self.live_mid = dmid
 
     def on_trade(self, t, price, side, size):
+        self._promote(t)                 # live quote reflects its lagged state at trade time
         m = self.mid()
         if self.debounce_trades > 0:
             self.trade_hist.append((price, size))
@@ -192,7 +221,8 @@ class Quoter:
         our_qmin = _qm(s_bid, s_ask, s_mid)
         tot_qmin = _qm(q_bid_book + s_bid, q_ask_book + s_ask, s_mid)
         if tot_qmin > 0:
-            self.reward += self._per_min * (our_qmin / tot_qmin)
+            share = min(our_qmin / tot_qmin, self.max_capture_share)   # competition caps real share
+            self.reward += self._per_min * share
 
     def adverse_selection(self):
         adverse = 0.0
