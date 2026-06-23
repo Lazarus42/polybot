@@ -99,7 +99,7 @@ class PaperSim:
         self.asks: dict[str, dict] = defaultdict(dict)
         self.q: dict[str, Quoter] = {}
         self.last_sample: dict[str, float] = {}
-        self._w = None; self._w_opened = 0.0
+        self._w = None; self._w_opened = 0.0; self._w_path = None
         self.n_snapshots = 0
 
     def _quoter(self, tok: str) -> Quoter | None:
@@ -114,13 +114,27 @@ class PaperSim:
                                  reward_min_size=m["min_size"], reward_v_cents=m["v_cents"], **self.kw)
         return self.q[tok]
 
+    def _close_current(self):
+        """Close the open spool and rename .tmp -> .jsonl.gz so the uploader only ever sees a
+        COMPLETE file (the open file stays *.tmp, which the uploader skips — no mid-write corruption)."""
+        if self._w:
+            self._w.close()
+            if self._w_path and self._w_path.endswith(".tmp"):
+                try:
+                    os.replace(self._w_path, self._w_path[:-4])
+                except OSError:
+                    pass
+        self._w = None; self._w_path = None
+
     def _writer(self, t):
         if self._w is None or (time.time() - self._w_opened) > self.rotate_s:
-            if self._w:
-                self._w.close()
+            self._close_current()
             host = os.uname().nodename.replace("_", "-")
-            # epoch in the name (like the collector) so the S3 uploader's date logic works uniformly
-            self._w = gzip.open(self.out_dir / f"paper_{host}_{os.getpid()}_{int(time.time())}.jsonl.gz", "wt")
+            # epoch in the name (like the collector) so the S3 uploader's date logic works uniformly;
+            # write to *.tmp while open, renamed on close so the uploader never grabs a partial file.
+            final = self.out_dir / f"paper_{host}_{os.getpid()}_{int(time.time())}.jsonl.gz"
+            self._w_path = str(final) + ".tmp"
+            self._w = gzip.open(self._w_path, "wt")
             self._w_opened = time.time()
         return self._w
 
@@ -203,8 +217,7 @@ class PaperSim:
             self.q[tok].on_quote(t, bb[0], ba[0], bb[1], ba[1])
 
     def close(self):
-        if self._w:
-            self._w.close()
+        self._close_current()
 
     def summary(self) -> dict:
         tot_reward = sum(q.reward for q in self.q.values())
