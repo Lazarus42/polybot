@@ -90,8 +90,10 @@ class PaperSim:
         self.allowed = None
         if capital and capital > 0:
             n = max(1, int(capital / size))
-            ranked = sorted((t for t, m in token_meta.items() if m["pool"] > 0),
-                            key=lambda t: token_meta[t]["pool"], reverse=True)
+            # only markets we can actually qualify for: our clip must clear min_incentive_size,
+            # else we score ZERO reward there. Rank the qualifiable ones by pool.
+            elig = [t for t, m in token_meta.items() if m["pool"] > 0 and m["min_size"] <= size]
+            ranked = sorted(elig, key=lambda t: token_meta[t]["pool"], reverse=True)
             self.allowed = set(ranked[:n])
         self.out_dir = out_dir; out_dir.mkdir(parents=True, exist_ok=True)
         self.rotate_s = rotate_minutes * 60.0
@@ -100,7 +102,7 @@ class PaperSim:
         self.q: dict[str, Quoter] = {}
         self.last_sample: dict[str, float] = {}
         self._w = None; self._w_opened = 0.0; self._w_path = None
-        self.n_snapshots = 0
+        self.n_snapshots = 0; self.msgs_in = 0
 
     def _quoter(self, tok: str) -> Quoter | None:
         m = self.meta.get(tok)
@@ -165,8 +167,16 @@ class PaperSim:
         }) + "\n")
         self.n_snapshots += 1
 
+    def heartbeat(self) -> str:
+        fills = sum(len(q.fills) for q in self.q.values())
+        reward = sum(q.reward for q in self.q.values())
+        quoting = sum(1 for q in self.q.values() if q.our_bid is not None or q.our_ask is not None)
+        return (f"[hb] msgs={self.msgs_in} markets={len(self.q)} quoting_now={quoting} "
+                f"snapshots={self.n_snapshots} fills={fills} reward=${reward:.2f}")
+
     def process_message(self, payload):
         """Handle one collector WS payload (book / price_change / last_trade_price). Idempotent."""
+        self.msgs_in += 1
         msgs = payload if isinstance(payload, list) else [payload]
         for e in msgs:
             et = e.get("event_type") or e.get("type")
@@ -254,6 +264,7 @@ def run_live(sim: PaperSim, tokens: list[str], minutes: float):
     import websocket  # noqa: PLC0415
     url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     stop_at = time.time() + minutes * 60.0
+    last_hb = [time.time()]
 
     def on_open(ws):
         ws.send(json.dumps({"type": "market", "assets_ids": sorted(tokens)}))
@@ -264,6 +275,8 @@ def run_live(sim: PaperSim, tokens: list[str], minutes: float):
             sim.process_message(json.loads(msg))
         except json.JSONDecodeError:
             pass  # non-JSON keepalive ("PONG")
+        if time.time() - last_hb[0] > 60.0:        # heartbeat to the journal every minute
+            print(sim.heartbeat(), flush=True); last_hb[0] = time.time()
         if time.time() > stop_at:
             ws.close()
 
