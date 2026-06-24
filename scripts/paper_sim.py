@@ -36,6 +36,7 @@ from reward_model import side_score  # noqa: E402
 from optimal_spread import const_eta, exp_lambda, solve_optimal_spread  # noqa: E402
 
 SAMPLE_SECONDS = 60.0
+MIDS_MAXLEN = 2000        # cap each quoter's mid history (paper-sim never needs full markout history)
 
 # Placeholder fill-rate / adverse-selection assumptions for the depth_optimal strategy's s*.
 # These are PARAMETRIC stand-ins (exponential fill decay A*e^{-k*s}, constant toxicity eta0 in
@@ -127,14 +128,29 @@ CONFIGS = {
     "fast_flat_stop3": dict(max_hold_minutes=10, stop_loss_cents=3.0),  # winner so far + stop-loss
     # all defenses together: 10-min bail + stop quoting outside [0.10,0.90] + liquidate on exit
     "guarded_flat": dict(max_hold_minutes=10, min_mid=0.10, max_mid=0.90, liq_outside_band=True),
-    # --- take-profit: lock winners at +X cents (frees capital to redeploy), with the guards ---
-    "take_profit_1c": dict(take_profit_cents=1.0),
-    "take_profit_2c": dict(take_profit_cents=2.0),
-    "take_profit_3c": dict(take_profit_cents=3.0),
-    "take_profit_5c": dict(take_profit_cents=5.0),
-    "tp_sl_3c": dict(take_profit_cents=3.0, stop_loss_cents=3.0),   # symmetric: lock +3c, cut -3c
-    "guarded_revolver": dict(take_profit_cents=3.0, stop_loss_cents=3.0,
-                             min_mid=0.10, max_mid=0.90, liq_outside_band=True),  # full package
+    # --- take-profit SWEEP: lock winners at +X, each ALSO carrying the symmetric guards (10-min bail
+    # + price band [0.10,0.90] with liquidation) so we never quote/hold at illiquid extremes and
+    # losers get cut too. Only the take-profit threshold varies, isolating its effect. ---
+    "take_profit_1c": dict(take_profit_cents=1.0, max_hold_minutes=10,
+                           min_mid=0.10, max_mid=0.90, liq_outside_band=True),
+    "take_profit_2c": dict(take_profit_cents=2.0, max_hold_minutes=10,
+                           min_mid=0.10, max_mid=0.90, liq_outside_band=True),
+    "take_profit_3c": dict(take_profit_cents=3.0, max_hold_minutes=10,
+                           min_mid=0.10, max_mid=0.90, liq_outside_band=True),
+    "take_profit_5c": dict(take_profit_cents=5.0, max_hold_minutes=10,
+                           min_mid=0.10, max_mid=0.90, liq_outside_band=True),
+    # --- SYMMETRIC price exit sweep: lock winner at +X AND cut loser at -X (matched stop/take),
+    # plus the same band + 10-min guards. Only the ±X threshold varies. ---
+    "tp_sl_1c": dict(take_profit_cents=1.0, stop_loss_cents=1.0, max_hold_minutes=10,
+                     min_mid=0.10, max_mid=0.90, liq_outside_band=True),
+    "tp_sl_2c": dict(take_profit_cents=2.0, stop_loss_cents=2.0, max_hold_minutes=10,
+                     min_mid=0.10, max_mid=0.90, liq_outside_band=True),
+    "tp_sl_3c": dict(take_profit_cents=3.0, stop_loss_cents=3.0, max_hold_minutes=10,
+                     min_mid=0.10, max_mid=0.90, liq_outside_band=True),
+    "tp_sl_5c": dict(take_profit_cents=5.0, stop_loss_cents=5.0, max_hold_minutes=10,
+                     min_mid=0.10, max_mid=0.90, liq_outside_band=True),
+    "guarded_revolver": dict(take_profit_cents=3.0, stop_loss_cents=3.0, max_hold_minutes=10,
+                             min_mid=0.10, max_mid=0.90, liq_outside_band=True),  # == tp_sl_3c
 }
 
 
@@ -168,6 +184,12 @@ class PaperSim:
         self.sizes: dict[str, dict] = {c: {} for c in configs}        # config -> {token: size}
         self.q: dict[tuple, Quoter] = {}      # (config, token) -> Quoter; created lazily in _ensure
         self.toks: set = set()                # any token at least one config quotes
+        # realized results of markets a strategy has EXITED (resolved/dropped) — folded in here so we
+        # can free their quoters without losing their reward/P&L from the running bankroll.
+        self.realized: dict[str, dict] = {c: {"reward": 0.0, "trade": 0.0, "flat_cost": 0.0,
+                                              "n_flat": 0, "fills": 0} for c in configs}
+        import threading  # noqa: PLC0415
+        self._lock = threading.Lock()         # serialize refresh (other thread) vs message handling
         self.bids: dict[str, dict] = defaultdict(dict)
         self.asks: dict[str, dict] = defaultdict(dict)
         self.last_sample: dict[str, float] = {}
@@ -184,8 +206,10 @@ class PaperSim:
         return self.size
 
     def _bankroll(self, c: str) -> float:
-        """A strategy's current equity: starting cash + reward + realized/marked trading P&L."""
-        eq = self.start_capital
+        """A strategy's current equity: starting cash + reward + realized/marked trading P&L,
+        including markets it has already exited (folded into self.realized)."""
+        r = self.realized[c]
+        eq = self.start_capital + r["reward"] + r["trade"]
         for t in self.toks:
             q = self.q.get((c, t))
             if q is None:
@@ -201,16 +225,26 @@ class PaperSim:
           3. enter new markets best reward-ROC first, while free cash covers the clip AND the
              market clears the min_roc hurdle (so we never deploy past diminishing returns).
         Returns the union of all configs' tokens (what to subscribe to)."""
+        with self._lock:
+            return self._reallocate(token_meta)
+
+    def _reallocate(self, token_meta: dict) -> list:
         self.meta = token_meta
         union = set()
         for c in self.configs:
             active = set(self.allowed.get(c, set()))
-            # 1. resolved markets: flatten and release
+            # 1. resolved markets: flatten, fold realized results into the running total, free quoter
             for t in list(active):
                 if t not in token_meta:
-                    q = self.q.get((c, t))
+                    q = self.q.pop((c, t), None)
                     if q is not None:
                         q._do_flatten()
+                        r = self.realized[c]
+                        r["reward"] += q.reward
+                        r["trade"] += q.cash - q.fees      # inv is 0 after flatten
+                        r["flat_cost"] += q.flat_cost
+                        r["n_flat"] += q.n_flats
+                        r["fills"] += len(q.fills)
                     active.discard(t); self.sizes[c].pop(t, None)
             # 2. free cash
             locked = sum(self.sizes[c].get(t, 0.0) for t in active)
@@ -234,6 +268,7 @@ class PaperSim:
                 active.add(t); self.sizes[c][t] = s; free -= s
             self.allowed[c] = active
             union |= active
+        self.toks = {t for (_c, t) in self.q}     # only tokens with a live quoter
         return sorted(union)
 
     def _ensure(self, tok: str) -> bool:
@@ -264,7 +299,7 @@ class PaperSim:
                                       max_capture_share=self.max_capture_share,
                                       quote_latency=self.quote_latency,
                                       cancel_on_move=self.cancel_on_move,
-                                      max_hold_seconds=mh, **kw)
+                                      max_hold_seconds=mh, mids_maxlen=MIDS_MAXLEN, **kw)
         if any_active:
             self.toks.add(tok)
         return any_active
@@ -328,30 +363,44 @@ class PaperSim:
 
     def _agg(self, cfg: str) -> dict:
         qs = [self.q[(cfg, t)] for t in self.toks if (cfg, t) in self.q]
-        reward = sum(q.reward for q in qs)
-        trade = sum(q.cash - q.fees + (q.inv * q.mids[-1][1] if q.mids else 0.0) for q in qs)
-        # cost to flatten the CURRENT inventory now (|inv| * half-spread) — continuous, not lumpy
+        r = self.realized[cfg]                      # results from markets already exited
+        reward = r["reward"] + sum(q.reward for q in qs)
+        trade = r["trade"] + sum(q.cash - q.fees + (q.inv * q.mids[-1][1] if q.mids else 0.0) for q in qs)
+        # cost to flatten the CURRENT (live) inventory now (|inv| * half-spread)
         liq = sum(abs(q.inv) * (q.best_ask - q.best_bid) / 2
                   for q in qs if q.best_bid is not None and q.best_ask is not None)
+        deployed = sum(self.sizes[cfg].get(t, 0.0) for t in self.allowed.get(cfg, ()))
         return {"reward": reward, "trade": trade, "net": reward + trade,
                 "bankroll": self.start_capital + reward + trade, "n_markets": len(self.allowed.get(cfg, ())),
-                "fills": sum(len(q.fills) for q in qs), "inv": sum(abs(q.inv) for q in qs),
+                "deployed": deployed,
+                "fills": r["fills"] + sum(len(q.fills) for q in qs), "inv": sum(abs(q.inv) for q in qs),
                 "liq_now": liq, "net_if_flat": reward + trade - liq,
-                "flat_cost": sum(q.flat_cost for q in qs), "n_flat": sum(q.n_flats for q in qs)}
+                "flat_cost": r["flat_cost"] + sum(q.flat_cost for q in qs),
+                "n_flat": r["n_flat"] + sum(q.n_flats for q in qs)}
 
     def heartbeat(self) -> str:
+        with self._lock:
+            return self._heartbeat()
+
+    def _heartbeat(self) -> str:
         head = f"[hb] msgs={self.msgs_in} markets={len(self.toks)} snapshots={self.n_snapshots}"
         lines = [head]
         for c in self.configs:                       # one line per strategy — head-to-head
             a = self._agg(c)
             # bankroll = revolving equity (start + reward + P&L); mkts = markets it currently quotes
-            lines.append(f"   {c:13} bankroll=${a['bankroll']:.2f} reward=${a['reward']:.4f} "
+            lines.append(f"   {c:16} bankroll=${a['bankroll']:.2f} reward=${a['reward']:.4f} "
                          f"net_if_flat=${a['net_if_flat']:.4f} mkts={a['n_markets']} "
-                         f"|inv|={a['inv']:.0f} flat=${a['flat_cost']:.4f}({a['n_flat']})")
+                         f"deployed=${a['deployed']:.0f} |inv|={a['inv']:.0f} "
+                         f"flat=${a['flat_cost']:.4f}({a['n_flat']})")
         return "\n".join(lines)
 
     def process_message(self, payload):
-        """Handle one collector WS payload (book / price_change / last_trade_price). Idempotent."""
+        """Handle one collector WS payload (book / price_change / last_trade_price). Idempotent.
+        Locked so a concurrent universe refresh can't mutate quoters mid-iteration."""
+        with self._lock:
+            self._process_message(payload)
+
+    def _process_message(self, payload):
         self.msgs_in += 1
         msgs = payload if isinstance(payload, list) else [payload]
         for e in msgs:
@@ -411,6 +460,10 @@ class PaperSim:
         self._close_current()
 
     def summary(self) -> dict:
+        with self._lock:
+            return self._summary()
+
+    def _summary(self) -> dict:
         out = {"size": ("min_qualify" if self.min_qualify else self.size),
                "start_capital": self.start_capital, "markets_subscribed": len(self.toks),
                "min_roc": self.min_roc, "snapshots": self.n_snapshots, "by_config": {}}
