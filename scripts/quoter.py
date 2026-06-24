@@ -32,7 +32,8 @@ class Quoter:
                  quote_latency: float = 0.0, cancel_on_move: float = 0.0,
                  max_hold_seconds: float = 0.0, quote_offset: float = 0.0,
                  min_mid: float = 0.0, max_mid: float = 1.0, liq_outside_band: bool = False,
-                 stop_loss_cents: float = 0.0, take_profit_cents: float = 0.0):
+                 stop_loss_cents: float = 0.0, take_profit_cents: float = 0.0,
+                 mids_maxlen: int = 0):
         self.our_size = our_size; self.inventory_cap = inventory_cap
         self.maker_fee = maker_fee; self.mark_delay_s = mark_delay_s
         self.improve = improve; self.tick = tick
@@ -81,7 +82,9 @@ class Quoter:
         self.cur_bid_depth = self.cur_ask_depth = 0.0
         self.inv = self.cash = self.fees = self.gross_spread = self.reward = 0.0
         self.fills: list[tuple[float, int, float]] = []
-        self.mids: list[tuple[float, float]] = []
+        # mids is appended every quote; in long LIVE runs cap it (deque auto-evicts oldest) so memory
+        # stays bounded. Backtests pass 0 -> unbounded list (adverse_selection() needs full history).
+        self.mids = deque(maxlen=mids_maxlen) if mids_maxlen and mids_maxlen > 0 else []
         self.ref_hist: deque = deque()
         self.trade_hist: deque = deque()
         self.vol_hist: deque = deque()
