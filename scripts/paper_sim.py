@@ -592,9 +592,9 @@ def main() -> None:
         if args.tokens_file and args.tokens_file.exists():
             tokens += [ln.strip() for ln in args.tokens_file.read_text().splitlines() if ln.strip()]
         if not tokens:
-            # only subscribe to the budgeted top-N markets (or all reward markets if unlimited)
-            tokens = sorted(sim.allowed) if sim.allowed is not None \
-                else [t for t, m in token_meta.items() if m["pool"] > 0]
+            # subscribe to the union of every strategy's allocated markets (allowed is per-config)
+            tokens = sorted(set().union(*sim.allowed.values())) if sim.allowed else \
+                [t for t, m in token_meta.items() if m["pool"] > 0]
         run_live(sim, tokens, args.minutes,
                  manifest_dir=args.manifest_dir, refresh_minutes=args.refresh_minutes)
 
