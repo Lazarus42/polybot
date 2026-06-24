@@ -14,3 +14,5 @@ archive/processed/underdog_events/fills_sorted.parquet
 
 # Reports / outputs (keep if you want; remove if you want tracked)
 reports/
+data/
+*.pem
