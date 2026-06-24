@@ -189,7 +189,7 @@ class PaperSim:
         self.realized: dict[str, dict] = {c: {"reward": 0.0, "trade": 0.0, "flat_cost": 0.0,
                                               "n_flat": 0, "fills": 0} for c in configs}
         import threading  # noqa: PLC0415
-        self._lock = threading.Lock()         # serialize refresh (other thread) vs message handling
+        self._lock = threading.RLock()        # reentrant: serialize refresh/heartbeat vs message handling
         self.bids: dict[str, dict] = defaultdict(dict)
         self.asks: dict[str, dict] = defaultdict(dict)
         self.last_sample: dict[str, float] = {}
@@ -522,7 +522,6 @@ def run_live(sim: PaperSim, tokens: list[str], minutes: float,
     import websocket  # noqa: PLC0415
     url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     stop_at = time.time() + minutes * 60.0
-    last_hb = [time.time()]
     state = {"tokens": list(tokens), "ws": None}
 
     def refresher():
@@ -538,14 +537,25 @@ def run_live(sim: PaperSim, tokens: list[str], minutes: float,
                     dropped = len(set(state["tokens"]) - set(new_tokens))
                     state["tokens"] = new_tokens
                     print(f"paper-sim universe refresh: {len(new_tokens)} markets "
-                          f"(+{added}/-{dropped}), ~${sim.capital_deployed:,.0f} deployed", flush=True)
+                          f"(+{added}/-{dropped})", flush=True)
                     if state["ws"] is not None:
                         state["ws"].close()   # reconnect -> on_open resubscribes to new_tokens
             except Exception as exc:  # noqa: BLE001
-                print("paper-sim refresh failed:", exc, flush=True)
+                print("paper-sim refresh failed:", repr(exc), flush=True)
+
+    def heartbeater():
+        # print on a fixed timer, independent of message flow, so silence never hides a live process;
+        # the msgs= counter then reveals whether the FEED has stalled vs the process being stuck.
+        while time.time() < stop_at:
+            time.sleep(60.0)
+            try:
+                print(sim.heartbeat(), flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print("paper-sim heartbeat error:", repr(exc), flush=True)
 
     if refresh_minutes and manifest_dir:
         threading.Thread(target=refresher, daemon=True).start()
+    threading.Thread(target=heartbeater, daemon=True).start()
 
     def on_open(ws):
         ws.send(json.dumps({"type": "market", "assets_ids": sorted(state["tokens"])}))
@@ -556,8 +566,6 @@ def run_live(sim: PaperSim, tokens: list[str], minutes: float,
             sim.process_message(json.loads(msg))
         except json.JSONDecodeError:
             pass  # non-JSON keepalive ("PONG")
-        if time.time() - last_hb[0] > 60.0:        # heartbeat to the journal every minute
-            print(sim.heartbeat(), flush=True); last_hb[0] = time.time()
         if time.time() > stop_at:
             ws.close()
 
