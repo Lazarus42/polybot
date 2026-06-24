@@ -387,7 +387,8 @@ class PaperSim:
     def _heartbeat(self) -> str:
         head = f"[hb] msgs={self.msgs_in} markets={len(self.toks)} snapshots={self.n_snapshots}"
         lines = [head, f"   DIAG ev={self._dbg_ev} first_reject={self._dbg_reject} "
-                       f"meta={len(self.meta)} subscribed_union={sum(len(s) for s in self.allowed.values()) and len(set().union(*self.allowed.values()))}"]
+                       f"meta={len(self.meta)} quoters={len(self.q)} "
+                       f"sample_allowed={next(iter(self.allowed['neutral']), None)}"]
         for c in self.configs:                       # one line per strategy — head-to-head
             a = self._agg(c)
             # bankroll = revolving equity (start + reward + P&L); mkts = markets it currently quotes
@@ -429,6 +430,9 @@ class PaperSim:
                 for pc in (e.get("price_changes") or []):
                     tok = str(pc.get("asset_id") or "")
                     if not self._ensure(tok):
+                        if self._dbg_reject is None:                  # DIAG: capture first pc rejection
+                            self._dbg_reject = ("pc", tok, tok in self.meta,
+                                                any(tok in self.allowed[c] for c in self.configs))
                         continue
                     price, sz = _f(pc.get("price")), _f(pc.get("size"))
                     side = str(pc.get("side") or "").upper()
