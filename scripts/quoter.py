@@ -30,7 +30,9 @@ class Quoter:
                  reward_pool: float = 0.0, reward_min_size: float = 0.0, reward_v_cents: float = 0.0,
                  fill_model: str = "fifo", capture_mult: float = 1.0, max_capture_share: float = 1.0,
                  quote_latency: float = 0.0, cancel_on_move: float = 0.0,
-                 max_hold_seconds: float = 0.0):
+                 max_hold_seconds: float = 0.0, quote_offset: float = 0.0,
+                 min_mid: float = 0.0, max_mid: float = 1.0, liq_outside_band: bool = False,
+                 stop_loss_cents: float = 0.0):
         self.our_size = our_size; self.inventory_cap = inventory_cap
         self.maker_fee = maker_fee; self.mark_delay_s = mark_delay_s
         self.improve = improve; self.tick = tick
@@ -50,6 +52,20 @@ class Quoter:
         # risk control: if a position is carried longer than this, actively cross out of it (so we
         # never hold inventory into a resolution, where it settles at $0/$1 not mid). 0 = never.
         self.max_hold_seconds = max_hold_seconds
+        # depth control: rest each side this far (in PRICE units, e.g. 0.012 = 1.2c) from the mid
+        # instead of pegging to the touch. This is the s* from optimal_spread that trades reward
+        # harvesting against adverse selection. 0 = legacy touch-pegged behaviour (unchanged).
+        self.quote_offset = quote_offset
+        # price-band gate (resolution guard): only quote when min_mid <= mid <= max_mid. Outside
+        # the band the reward is tiny and the tail (snap to 0/1) is huge, so we stand aside.
+        self.min_mid = min_mid; self.max_mid = max_mid
+        # when True, actively liquidate inventory (cross out) the moment the mid leaves the band,
+        # instead of only ceasing to quote — so we don't ride a position into resolution.
+        self.liq_outside_band = liq_outside_band
+        # stop-loss: if the open position is more than this many cents/share underwater (mid vs our
+        # average entry), liquidate it. 0 = off. Cuts losers without waiting for the max-hold clock.
+        self.stop_loss_cents = stop_loss_cents
+        self.avg_entry = 0.0             # volume-weighted entry price of the OPEN position
         self.inv_since = None            # time inventory first became non-zero (for max-hold)
         self.flat_cost = 0.0; self.n_flats = 0   # spread paid crossing out of stale inventory
         # runtime state
@@ -122,14 +138,27 @@ class Quoter:
             if self.last_ask_fill is not None and t - self.last_ask_fill[0] <= self.tox_window \
                     and m > self.last_ask_fill[1] + self.tox_threshold:
                 self.ask_off_until = t + self.tox_cooldown
-        bid_open = self.want_bid and t >= self.bid_off_until
-        ask_open = self.want_ask and t >= self.ask_off_until
+        in_band = m is not None and self.min_mid <= m <= self.max_mid
+        if self.liq_outside_band and m is not None and not in_band and self.inv != 0:
+            self._do_flatten()           # price went extreme -> dump before it resolves to 0/1
+        self._maybe_stop()               # stop-loss: cut the position if too far underwater
+        bid_open = self.want_bid and t >= self.bid_off_until and in_band
+        ask_open = self.want_ask and t >= self.ask_off_until and in_band
         if bid_open or ask_open:
             if self.first_quote_t is None:
                 self.first_quote_t = t
             self.last_quote_t = t
-        nb = self.best_bid + self.tick if self.improve else self.best_bid
-        na = self.best_ask - self.tick if self.improve else self.best_ask
+        if self.quote_offset > 0.0 and m is not None:
+            # rest s* from the mid (the reward/adverse-selection optimum), not at the touch. This
+            # may sit inside the spread (improving, when s* < half the touch spread) or behind the
+            # touch (deeper, when s* is wider); both are valid passive placements and the price-
+            # crossing fill model handles the resulting fill rate. Reward is scored on this same
+            # mid-distance via credit_sample, so quote_offset IS the s fed to the equation.
+            nb = m - self.quote_offset
+            na = m + self.quote_offset
+        else:
+            nb = self.best_bid + self.tick if self.improve else self.best_bid
+            na = self.best_ask - self.tick if self.improve else self.best_ask
         if nb >= na:
             nb, na = self.best_bid, self.best_ask
         if self.vol_spread_coeff > 0.0:
@@ -195,6 +224,7 @@ class Quoter:
                 fillable = min(self.our_size, size - self.q_bid_ahead, self.inventory_cap - self.inv)
                 self.q_bid_ahead = 0.0
             if fillable > 0:
+                self._record_entry(+fillable, self.our_bid)
                 self.inv += fillable; self.cash -= fillable * self.our_bid
                 self.fees += self.maker_fee * fillable * self.our_bid
                 if m is not None:
@@ -212,6 +242,7 @@ class Quoter:
                 fillable = min(self.our_size, size - self.q_ask_ahead, self.inventory_cap + self.inv)
                 self.q_ask_ahead = 0.0
             if fillable > 0:
+                self._record_entry(-fillable, self.our_ask)
                 self.inv -= fillable; self.cash += fillable * self.our_ask
                 self.fees += self.maker_fee * fillable * self.our_ask
                 if m is not None:
@@ -219,14 +250,28 @@ class Quoter:
                     self.fills.append((t, -1, m)); self.last_ask_fill = (t, m)
         # track how long we've been carrying a position, and force-exit if it's too old
         self.inv_since = None if self.inv == 0 else (self.inv_since or t)
+        self._maybe_stop()
         self._maybe_flatten(t)
 
-    def _maybe_flatten(self, t):
-        """Cross the spread to exit any position held longer than max_hold_seconds (resolution
-        risk control). Pays the half-spread to flatten — the realistic cost of not carrying it."""
-        if self.max_hold_seconds <= 0 or self.inv == 0 or self.inv_since is None:
-            return
-        if t - self.inv_since < self.max_hold_seconds:
+    def _record_entry(self, dq, price):
+        """Maintain the open position's volume-weighted entry price as fills arrive.
+        dq is signed (+buy / -sell). Adding to the position averages in; reducing leaves the
+        entry as-is; flipping the sign resets it to the new fill price."""
+        prev = self.inv
+        new = prev + dq
+        if prev == 0 or (prev > 0) == (dq > 0):                # opening / adding same direction
+            denom = abs(prev) + abs(dq)
+            self.avg_entry = (abs(prev) * self.avg_entry + abs(dq) * price) / denom if denom else price
+        elif new == 0:                                        # closed flat
+            self.avg_entry = 0.0
+        elif (new > 0) != (prev > 0):                         # flipped sides
+            self.avg_entry = price
+        # pure reduction (same sign, smaller): keep avg_entry
+
+    def _do_flatten(self):
+        """Cross the spread to exit the whole position now, paying the half-spread (the realistic
+        cost of getting flat). Shared by the max-hold timer, extreme-price, and stop-loss exits."""
+        if self.inv == 0:
             return
         m = self.mid()
         if m is None or self.best_bid is None or self.best_ask is None:
@@ -235,7 +280,26 @@ class Quoter:
         self.cash += self.inv * (m - (half if self.inv > 0 else -half))   # sell at bid / buy at ask
         self.flat_cost += abs(self.inv) * half       # the spread we paid to get flat
         self.n_flats += 1
-        self.inv = 0.0; self.inv_since = None
+        self.inv = 0.0; self.inv_since = None; self.avg_entry = 0.0
+
+    def _maybe_stop(self):
+        """Liquidate if the open position is more than stop_loss_cents underwater (mid vs entry)."""
+        if self.stop_loss_cents <= 0 or self.inv == 0 or self.avg_entry == 0:
+            return
+        m = self.mid()
+        if m is None:
+            return
+        loss_c = ((self.avg_entry - m) if self.inv > 0 else (m - self.avg_entry)) * 100.0
+        if loss_c >= self.stop_loss_cents - 1e-9:
+            self._do_flatten()
+
+    def _maybe_flatten(self, t):
+        """Force-exit a position held longer than max_hold_seconds (time-based resolution guard)."""
+        if self.max_hold_seconds <= 0 or self.inv == 0 or self.inv_since is None:
+            return
+        if t - self.inv_since < self.max_hold_seconds:
+            return
+        self._do_flatten()
 
     def credit_sample(self, s_mid, q_bid_book, q_ask_book):
         """Accrue one per-minute reward sample from the CURRENT live quote placement."""

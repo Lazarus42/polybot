@@ -100,7 +100,12 @@ def simulate_book_mm(events: list[dict], our_size: float, inventory_cap: float,
                      reward_pool: float = 0.0, reward_min_size: float = 0.0,
                      reward_v_cents: float = 0.0,
                      # --- fill realism (default 'fifo' == legacy) ---
-                     fill_model: str = "fifo", capture_mult: float = 1.0) -> dict[str, Any]:
+                     fill_model: str = "fifo", capture_mult: float = 1.0,
+                     # --- depth control: rest s* from mid instead of the touch (0 == legacy) ---
+                     quote_offset: float = 0.0,
+                     # --- price-band gate (resolution guard); default [0,1] == quote everywhere ---
+                     min_mid: float = 0.0, max_mid: float = 1.0,
+                     liq_outside_band: bool = False, stop_loss_cents: float = 0.0) -> dict[str, Any]:
     """Replay one token's normalized event stream as a passive two-sided MM.
 
     With `skew_threshold` > 0 the MM becomes SIGNAL-INFORMED: it quotes the bid only when the
@@ -146,7 +151,9 @@ def simulate_book_mm(events: list[dict], our_size: float, inventory_cap: float,
                vol_window=vol_window, vol_spread_coeff=vol_spread_coeff, tox_threshold=tox_threshold,
                tox_window=tox_window, tox_cooldown=tox_cooldown, reward_pool=reward_pool,
                reward_min_size=reward_min_size, reward_v_cents=reward_v_cents,
-               fill_model=fill_model, capture_mult=capture_mult)
+               fill_model=fill_model, capture_mult=capture_mult, quote_offset=quote_offset,
+               min_mid=min_mid, max_mid=max_mid, liq_outside_band=liq_outside_band,
+               stop_loss_cents=stop_loss_cents)
     rw_on = bool(depth_samples) and reward_pool > 0 and reward_v_cents > 0
     smp = 0
 

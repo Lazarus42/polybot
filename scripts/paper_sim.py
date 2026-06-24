@@ -33,8 +33,35 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from quoter import Quoter  # noqa: E402
 from reward_model import side_score  # noqa: E402
+from optimal_spread import const_eta, exp_lambda, solve_optimal_spread  # noqa: E402
 
 SAMPLE_SECONDS = 60.0
+
+# Placeholder fill-rate / adverse-selection assumptions for the depth_optimal strategy's s*.
+# These are PARAMETRIC stand-ins (exponential fill decay A*e^{-k*s}, constant toxicity eta0 in
+# cents/share) until per-market lambda(s)/eta(s) are fit from the tape (stale_order_pool.py).
+# Replace `depth_params_for(token)` with the fitted curves once available.
+# Measured from data/pull/dt=2026-06-22 (the "other" bucket = ~whole universe): fill rate barely
+# decays with depth (k~0.012) and touch toxicity eta0~0.29c. Placeholder guesses were a=20,k=1.0.
+DEPTH_PARAMS = dict(a=0.007, k=0.012, eta0=0.286, size=1.0)
+
+
+def optimal_offset_cents(v_cents: float, per_min_reward: float, size: float = 1.0) -> float:
+    """s* (in CENTS) balancing reward harvesting vs adverse selection for one token.
+
+    The equation is in CENTS-PER-SHARE / min, so every term must be normalised per resting share:
+    r0 = reward at the touch in those units = per_min_reward ($/min) * 100 (c/$) / size (shares).
+    The trading term uses size=1 (already per-share). Returns 0 (-> touch placement) for a
+    degenerate band or a sub-tick optimum.
+    """
+    if v_cents <= 0 or size <= 0:
+        return 0.0
+    r0 = max(per_min_reward, 0.0) * 100.0 / size
+    res = solve_optimal_spread(v=v_cents, r0=r0,
+                               lam=exp_lambda(DEPTH_PARAMS["a"], DEPTH_PARAMS["k"]),
+                               eta=const_eta(DEPTH_PARAMS["eta0"]), size=1.0)
+    s = res["s_star"]
+    return s if s >= 0.1 else 0.0      # below a tenth of a cent: treat as touch (no offset)
 
 
 def _f(x):
@@ -71,6 +98,33 @@ CONFIGS = {
     "clv_full": dict(momentum_window=300, skew_threshold=0.005, debounce_trades=10, inv_skew=0.01,
                      vol_window=300, vol_spread_coeff=0.5, tox_threshold=0.01, tox_window=60,
                      tox_cooldown=60),
+    # rest at s* (computed per-token from optimal_spread) instead of the touch, and SKEW on
+    # inventory rather than pulling a side (no tox gate -> Q_min never collapses). The "_optimal"
+    # marker tells _ensure to inject a per-token quote_offset; it is not a Quoter kwarg.
+    "depth_optimal": dict(inv_skew=0.01, _optimal=True),
+    # resolution-guarded variants: same as neutral but only quote inside a mid band. Run these
+    # head-to-head to find the band that best protects net_if_flat from the snap-to-0/1 tail.
+    "band_10_90": dict(min_mid=0.10, max_mid=0.90),
+    "band_20_80": dict(min_mid=0.20, max_mid=0.80),
+    "band_30_70": dict(min_mid=0.30, max_mid=0.70),
+    "depth_optimal_guarded": dict(inv_skew=0.01, _optimal=True, min_mid=0.10, max_mid=0.90),
+    # --- tail-control experiment: cap inventory / bail faster / lean against position ---
+    "tight_inv": dict(inv_cap_mult=0.25),                 # carry at most 1/4 the inventory
+    "fast_flat": dict(max_hold_minutes=10),               # bail out of a position after 10 min
+    "fast_flat_5": dict(max_hold_minutes=5),              # even faster bail, to bracket the timing
+    "skew_revert": dict(inv_skew=0.02),                   # lean quotes to shed inventory
+    "tail_guard": dict(inv_cap_mult=0.25, max_hold_minutes=10, inv_skew=0.02,
+                       min_mid=0.10, max_mid=0.90),       # all three + stand aside near resolution
+    # --- extreme-price liquidation: dump the position the moment the price leaves the band ---
+    "exit_extreme": dict(min_mid=0.10, max_mid=0.90, liq_outside_band=True),
+    "exit_extreme_tight": dict(min_mid=0.15, max_mid=0.85, liq_outside_band=True),
+    "exit_extreme_fast": dict(min_mid=0.10, max_mid=0.90, liq_outside_band=True,
+                              max_hold_minutes=10),        # extreme-dump + 10-min bail combined
+    # --- stop-loss: cut a position once it's X cents/share underwater (vs our average entry) ---
+    "stop_2c": dict(stop_loss_cents=2.0),
+    "stop_3c": dict(stop_loss_cents=3.0),
+    "stop_5c": dict(stop_loss_cents=5.0),
+    "fast_flat_stop3": dict(max_hold_minutes=10, stop_loss_cents=3.0),  # winner so far + stop-loss
 }
 
 
@@ -121,13 +175,21 @@ class PaperSim:
             return False   # outside the capital budget's top-N markets
         if tok not in self.toks:
             for c in self.configs:
-                self.q[(c, tok)] = Quoter(self.size, self.inv_cap, fill_model=self.fill_model,
+                kw = dict(self.kw[c])
+                if kw.pop("_optimal", False):
+                    # per-token s*: r0 = this token's per-minute reward slice at the touch
+                    s_star_c = optimal_offset_cents(m["v_cents"], m["pool"] / 1440.0, self.size)
+                    kw["quote_offset"] = s_star_c / 100.0   # cents -> price units
+                # per-config overrides for the inventory/flatten experiment (else use the globals)
+                inv_cap = self.size * kw.pop("inv_cap_mult") if "inv_cap_mult" in kw else self.inv_cap
+                mh = kw.pop("max_hold_minutes") * 60.0 if "max_hold_minutes" in kw else self.max_hold_seconds
+                self.q[(c, tok)] = Quoter(self.size, inv_cap, fill_model=self.fill_model,
                                           capture_mult=self.capture_mult, reward_pool=m["pool"],
                                           reward_min_size=m["min_size"], reward_v_cents=m["v_cents"],
                                           max_capture_share=self.max_capture_share,
                                           quote_latency=self.quote_latency,
                                           cancel_on_move=self.cancel_on_move,
-                                          max_hold_seconds=self.max_hold_seconds, **self.kw[c])
+                                          max_hold_seconds=mh, **kw)
             self.toks.add(tok)
         return True
 
@@ -281,15 +343,32 @@ class PaperSim:
         return out
 
 
-def run_replay(sim: PaperSim, path: Path):
-    opener = gzip.open if str(path).endswith(".gz") else open
-    with opener(path, "rt") as fh:
-        for line in fh:
-            if line.strip():
-                try:
-                    sim.process_message(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+def run_replay(sim: PaperSim, paths):
+    """Replay one or more captured files in chronological order (single sim, single close)."""
+    import glob as _glob
+    import re as _re
+    if isinstance(paths, (str, Path)):
+        paths = [paths]
+    files = []
+    for p in paths:
+        files.extend(_glob.glob(str(p)))
+    # order by the epoch embedded in the collector filename so the tape is chronological
+    def _epoch(p):
+        m = _re.search(r"_(\d+)\.jsonl", os.path.basename(p))
+        return int(m.group(1)) if m else 0
+    files.sort(key=_epoch)
+    for path in files:
+        opener = gzip.open if path.endswith(".gz") else open
+        try:
+            with opener(path, "rt") as fh:
+                for line in fh:
+                    if line.strip():
+                        try:
+                            sim.process_message(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+        except (OSError, EOFError) as e:
+            print(f"skip {os.path.basename(path)}: {e}", flush=True)
     sim.close()
 
 
@@ -337,7 +416,8 @@ def reconcile_rewards(tokens: list[str]) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--replay", type=Path, help="captured collector jsonl(.gz) to replay offline")
+    g.add_argument("--replay", type=str, nargs="+",
+                   help="captured collector jsonl(.gz) file(s)/glob(s) to replay offline, in time order")
     g.add_argument("--live", action="store_true", help="stream the live CLOB WebSocket")
     ap.add_argument("--manifest", type=Path, default=None, help="manifest_*.json for token reward params")
     ap.add_argument("--manifest-dir", type=Path, default=None)
