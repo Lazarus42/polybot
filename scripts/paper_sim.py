@@ -195,6 +195,8 @@ class PaperSim:
         self.last_sample: dict[str, float] = {}
         self._w = None; self._w_opened = 0.0; self._w_path = None
         self.n_snapshots = 0; self.msgs_in = 0
+        self._dbg_ev: dict = {}               # DIAG: event-type counts seen on the feed
+        self._dbg_reject = None               # DIAG: (token, in_meta, in_allowed) of first reject
         self.reallocate(token_meta)           # initial per-config allocation
         self.out_dir = out_dir; out_dir.mkdir(parents=True, exist_ok=True)
         self.rotate_s = rotate_minutes * 60.0
@@ -384,7 +386,8 @@ class PaperSim:
 
     def _heartbeat(self) -> str:
         head = f"[hb] msgs={self.msgs_in} markets={len(self.toks)} snapshots={self.n_snapshots}"
-        lines = [head]
+        lines = [head, f"   DIAG ev={self._dbg_ev} first_reject={self._dbg_reject} "
+                       f"meta={len(self.meta)} subscribed_union={sum(len(s) for s in self.allowed.values()) and len(set().union(*self.allowed.values()))}"]
         for c in self.configs:                       # one line per strategy — head-to-head
             a = self._agg(c)
             # bankroll = revolving equity (start + reward + P&L); mkts = markets it currently quotes
@@ -405,10 +408,14 @@ class PaperSim:
         msgs = payload if isinstance(payload, list) else [payload]
         for e in msgs:
             et = e.get("event_type") or e.get("type")
+            self._dbg_ev[et] = self._dbg_ev.get(et, 0) + 1            # DIAG: event-type counts
             t = _ts(e.get("timestamp"))
             if et == "book":
                 tok = str(e.get("asset_id") or "")
                 if not self._ensure(tok):
+                    if self._dbg_reject is None:                      # DIAG: capture first rejection
+                        self._dbg_reject = (tok, tok in self.meta,
+                                            any(tok in self.allowed[c] for c in self.configs))
                     continue
                 self.bids[tok] = {pp: ss for pp, ss in
                                   ((_f(b.get("price")), _f(b.get("size"))) for b in (e.get("bids") or []))
