@@ -19,7 +19,7 @@ ExecStart=/home/ec2-user/polymarket_exp/.venv/bin/python scripts/paper_sim.py \
     --size 0 --capital 5000 --inv-cap-mult 5 --fill-model prorata --max-capture-share 0.10 \
     --quote-latency 0.2 --cancel-on-move 0.01 --max-hold-minutes 120 \
     --manifest-dir /home/ec2-user/polymarket_exp/reports/clob_capture \
-    --minutes 1000000000 --rotate-minutes 15 --refresh-minutes 30 \
+    --minutes 1000000000 --rotate-minutes 15 --refresh-minutes 5 \
     --output-dir /home/ec2-user/polymarket_exp/reports/paper_sim
 Restart=always
 RestartSec=10

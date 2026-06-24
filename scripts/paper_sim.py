@@ -47,6 +47,13 @@ MIDS_MAXLEN = 2000        # cap each quoter's mid history (paper-sim never needs
 DEPTH_PARAMS = dict(a=0.007, k=0.012, eta0=0.286, size=1.0)
 
 
+def _is_ephemeral(question: str) -> bool:
+    """True for ultra-short-lived markets (the 5-minute crypto 'up or down' churn) — bad for
+    market-making (they resolve faster than we can refresh and are pure resolution risk)."""
+    q = (question or "").lower()
+    return "up or down" in q or "updown" in q
+
+
 def optimal_offset_cents(v_cents: float, per_min_reward: float, size: float = 1.0) -> float:
     """s* (in CENTS) balancing reward harvesting vs adverse selection for one token.
 
@@ -188,6 +195,7 @@ class PaperSim:
         # can free their quoters without losing their reward/P&L from the running bankroll.
         self.realized: dict[str, dict] = {c: {"reward": 0.0, "trade": 0.0, "flat_cost": 0.0,
                                               "n_flat": 0, "fills": 0} for c in configs}
+        self.deployed_clip: dict[str, float] = {c: 0.0 for c in configs}   # capital committed per config
         import threading  # noqa: PLC0415
         self._lock = threading.RLock()        # reentrant: serialize refresh/heartbeat vs message handling
         self.bids: dict[str, dict] = defaultdict(dict)
@@ -197,6 +205,7 @@ class PaperSim:
         self.n_snapshots = 0; self.msgs_in = 0
         self._dbg_ev: dict = {}               # DIAG: event-type counts seen on the feed
         self._dbg_reject = None               # DIAG: (token, in_meta, in_allowed) of first reject
+        self._dbg_pc = [0, 0, 0]              # DIAG: pc tokens [total, in_meta, in_allocated]
         self.reallocate(token_meta)           # initial per-config allocation
         self.out_dir = out_dir; out_dir.mkdir(parents=True, exist_ok=True)
         self.rotate_s = rotate_minutes * 60.0
@@ -221,72 +230,67 @@ class PaperSim:
         return eq
 
     def reallocate(self, token_meta: dict) -> list:
-        """Per-strategy capital allocation. For each config independently:
-          1. drop markets that resolved (gone from the manifest) — flatten to free their capital,
-          2. measure free cash = bankroll − capital locked in the markets it's still in,
-          3. enter new markets best reward-ROC first, while free cash covers the clip AND the
-             market clears the min_roc hurdle (so we never deploy past diminishing returns).
-        Returns the union of all configs' tokens (what to subscribe to)."""
+        """Refresh the manifest and free capital from resolved markets. Allocation itself is
+        DEMAND-DRIVEN (see _ensure): we only commit capital to a market when we actually observe it
+        streaming AND it's in the manifest — so we never quote a stale/dead market. This call:
+          1. swaps in the new manifest,
+          2. drops markets that resolved (gone from the manifest) — flatten, fold realized P&L,
+             release their capital,
+        and returns the eligible (durable, reward-paying) manifest tokens to SUBSCRIBE to."""
         with self._lock:
             return self._reallocate(token_meta)
 
     def _reallocate(self, token_meta: dict) -> list:
         self.meta = token_meta
-        union = set()
         for c in self.configs:
-            active = set(self.allowed.get(c, set()))
-            # 1. resolved markets: flatten, fold realized results into the running total, free quoter
-            for t in list(active):
-                if t not in token_meta:
+            for t in list(self.allowed.get(c, set())):
+                if t not in token_meta:                            # resolved -> exit and free capital
                     q = self.q.pop((c, t), None)
                     if q is not None:
                         q._do_flatten()
                         r = self.realized[c]
                         r["reward"] += q.reward
-                        r["trade"] += q.cash - q.fees      # inv is 0 after flatten
+                        r["trade"] += q.cash - q.fees              # inv is 0 after flatten
                         r["flat_cost"] += q.flat_cost
                         r["n_flat"] += q.n_flats
                         r["fills"] += len(q.fills)
-                    active.discard(t); self.sizes[c].pop(t, None)
-            # 2. free cash
-            locked = sum(self.sizes[c].get(t, 0.0) for t in active)
-            free = self._bankroll(c) - locked
-            # 3. rank candidates by reward-ROC (est daily reward per $ of clip)
-            cands = []
-            for t, m in token_meta.items():
-                if t in active or m.get("pool", 0) <= 0 or m.get("v_cents", 0) <= 0:
-                    continue
-                s = self._size_for(m)
-                if s <= 0:
-                    continue
-                roc = (m["pool"] * self.max_capture_share) / s     # $reward/$/day (clip ~ $1/share)
-                if roc < self.min_roc:
-                    continue
-                cands.append((roc, t, s))
-            cands.sort(reverse=True)
-            for roc, t, s in cands:
-                if self.start_capital and self.start_capital > 0 and free < s:
-                    continue                                       # try a smaller market
-                active.add(t); self.sizes[c][t] = s; free -= s
-            self.allowed[c] = active
-            union |= active
-        self.toks = {t for (_c, t) in self.q}     # only tokens with a live quoter
-        return sorted(union)
+                    self.allowed[c].discard(t)
+                    self.deployed_clip[c] -= self.sizes[c].pop(t, 0.0)
+        self.toks = {t for (_c, t) in self.q}
+        # subscribe to every eligible (durable, reward-paying) manifest market; capital is committed
+        # lazily as they stream, so the subscription set is the SUPERSET we're willing to quote.
+        self.universe = sorted(t for t, m in token_meta.items()
+                               if m.get("pool", 0) > 0 and m.get("v_cents", 0) > 0
+                               and not _is_ephemeral(m.get("question", "")))
+        return self.universe
 
     def _ensure(self, tok: str) -> bool:
-        """Create a Quoter for each config that has ALLOCATED this token (per-config market sets)."""
+        """Demand-driven allocation: only markets IN THE MANIFEST (m is not None) get quoted, and a
+        strategy commits capital to one the first time it's seen streaming — if the market is durable,
+        clears the reward-ROC hurdle, and the strategy still has free capital. Guarantees we only ever
+        trade markets we're actually capturing."""
         m = self.meta.get(tok)
         if not m or m["v_cents"] <= 0:
+            return False                                  # not in the manifest -> never quote it
+        if _is_ephemeral(m.get("question", "")):
+            return False                                  # 5-min crypto churn -> skip
+        size = self._size_for(m)
+        if size <= 0:
             return False
+        roc = (m["pool"] * self.max_capture_share) / size     # est reward $/$/day
         any_active = False
         for c in self.configs:
-            if tok not in self.allowed.get(c, set()):
-                continue
+            if tok not in self.allowed[c]:
+                # consider committing capital to this freshly-seen market
+                if roc < self.min_roc:
+                    continue
+                if self.start_capital > 0:                 # capital<=0 => unlimited (quote everything)
+                    avail = self.start_capital + self.realized[c]["reward"] + self.realized[c]["trade"]
+                    if self.deployed_clip[c] + size > avail:
+                        continue                          # no free capital for this strategy
+                self.allowed[c].add(tok); self.sizes[c][tok] = size; self.deployed_clip[c] += size
             any_active = True
             if (c, tok) in self.q:
-                continue
-            size = self.sizes[c].get(tok, 0.0)
-            if size <= 0:
                 continue
             kw = dict(self.kw[c])
             if kw.pop("_optimal", False):
@@ -386,9 +390,8 @@ class PaperSim:
 
     def _heartbeat(self) -> str:
         head = f"[hb] msgs={self.msgs_in} markets={len(self.toks)} snapshots={self.n_snapshots}"
-        lines = [head, f"   DIAG ev={self._dbg_ev} first_reject={self._dbg_reject} "
-                       f"meta={len(self.meta)} quoters={len(self.q)} "
-                       f"sample_allowed={next(iter(self.allowed['neutral']), None)}"]
+        lines = [head, f"   DIAG ev={self._dbg_ev} pc[total,in_meta,allocated]={self._dbg_pc} "
+                       f"meta={len(self.meta)} quoters={len(self.q)}"]
         for c in self.configs:                       # one line per strategy — head-to-head
             a = self._agg(c)
             # bankroll = revolving equity (start + reward + P&L); mkts = markets it currently quotes
@@ -429,6 +432,11 @@ class PaperSim:
             elif et == "price_change":
                 for pc in (e.get("price_changes") or []):
                     tok = str(pc.get("asset_id") or "")
+                    self._dbg_pc[0] += 1                              # DIAG: total pc tokens seen
+                    if tok in self.meta:
+                        self._dbg_pc[1] += 1                         # ... that are in the manifest
+                        if any(tok in self.allowed[c] for c in self.configs):
+                            self._dbg_pc[2] += 1                     # ... that we allocated
                     if not self._ensure(tok):
                         if self._dbg_reject is None:                  # DIAG: capture first pc rejection
                             self._dbg_reject = ("pc", tok, tok in self.meta,
@@ -644,8 +652,8 @@ def main() -> None:
                    max_hold_seconds=args.max_hold_minutes * 60.0, min_roc=args.min_roc)
     size_desc = "min-qualify" if args.size <= 0 else str(args.size)
     print(f"paper-sim: configs={args.configs} size={size_desc} capital=${args.capital:,.0f}/strategy "
-          f"min_roc={args.min_roc} -> each strategy quotes {len(sim.allowed[args.configs[0]])} markets "
-          f"at start; reward-tokens={sum(1 for m in token_meta.values() if m['pool']>0)}", flush=True)
+          f"min_roc={args.min_roc} -> {len(sim.universe)} eligible markets to watch; capital committed "
+          f"on first sight; reward-tokens={sum(1 for m in token_meta.values() if m['pool']>0)}", flush=True)
 
     # close the spool cleanly on systemd stop/restart (rename .tmp -> .jsonl.gz so it ships, not lost)
     import signal  # noqa: PLC0415
@@ -664,9 +672,7 @@ def main() -> None:
         if args.tokens_file and args.tokens_file.exists():
             tokens += [ln.strip() for ln in args.tokens_file.read_text().splitlines() if ln.strip()]
         if not tokens:
-            # subscribe to the union of every strategy's allocated markets (allowed is per-config)
-            tokens = sorted(set().union(*sim.allowed.values())) if sim.allowed else \
-                [t for t, m in token_meta.items() if m["pool"] > 0]
+            tokens = list(sim.universe)   # all eligible manifest markets; capital committed on first sight
         run_live(sim, tokens, args.minutes,
                  manifest_dir=args.manifest_dir, refresh_minutes=args.refresh_minutes)
 
