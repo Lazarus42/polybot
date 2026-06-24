@@ -206,6 +206,7 @@ class PaperSim:
         self._dbg_ev: dict = {}               # DIAG: event-type counts seen on the feed
         self._dbg_reject = None               # DIAG: (token, in_meta, in_allowed) of first reject
         self._dbg_pc = [0, 0, 0]              # DIAG: pc tokens [total, in_meta, in_allocated]
+        self._dbg_err = None                  # DIAG: first per-event exception (repr + last frame)
         self.reallocate(token_meta)           # initial per-config allocation
         self.out_dir = out_dir; out_dir.mkdir(parents=True, exist_ok=True)
         self.rotate_s = rotate_minutes * 60.0
@@ -391,7 +392,7 @@ class PaperSim:
     def _heartbeat(self) -> str:
         head = f"[hb] msgs={self.msgs_in} markets={len(self.toks)} snapshots={self.n_snapshots}"
         lines = [head, f"   DIAG ev={self._dbg_ev} pc[total,in_meta,allocated]={self._dbg_pc} "
-                       f"meta={len(self.meta)} quoters={len(self.q)}"]
+                       f"meta={len(self.meta)} quoters={len(self.q)} err={self._dbg_err}"]
         for c in self.configs:                       # one line per strategy — head-to-head
             a = self._agg(c)
             # bankroll = revolving equity (start + reward + P&L); mkts = markets it currently quotes
@@ -411,6 +412,15 @@ class PaperSim:
         self.msgs_in += 1
         msgs = payload if isinstance(payload, list) else [payload]
         for e in msgs:
+            try:
+                self._handle_event(e)
+            except Exception as exc:  # noqa: BLE001  surface (don't let the WS swallow it silently)
+                if self._dbg_err is None:
+                    import traceback
+                    self._dbg_err = repr(exc) + " | " + traceback.format_exc().splitlines()[-2][:120]
+
+    def _handle_event(self, e):
+        if True:
             et = e.get("event_type") or e.get("type")
             self._dbg_ev[et] = self._dbg_ev.get(et, 0) + 1            # DIAG: event-type counts
             t = _ts(e.get("timestamp"))
@@ -420,7 +430,7 @@ class PaperSim:
                     if self._dbg_reject is None:                      # DIAG: capture first rejection
                         self._dbg_reject = (tok, tok in self.meta,
                                             any(tok in self.allowed[c] for c in self.configs))
-                    continue
+                    return
                 self.bids[tok] = {pp: ss for pp, ss in
                                   ((_f(b.get("price")), _f(b.get("size"))) for b in (e.get("bids") or []))
                                   if pp is not None and ss}
