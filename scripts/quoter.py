@@ -32,7 +32,7 @@ class Quoter:
                  quote_latency: float = 0.0, cancel_on_move: float = 0.0,
                  max_hold_seconds: float = 0.0, quote_offset: float = 0.0,
                  min_mid: float = 0.0, max_mid: float = 1.0, liq_outside_band: bool = False,
-                 stop_loss_cents: float = 0.0):
+                 stop_loss_cents: float = 0.0, take_profit_cents: float = 0.0):
         self.our_size = our_size; self.inventory_cap = inventory_cap
         self.maker_fee = maker_fee; self.mark_delay_s = mark_delay_s
         self.improve = improve; self.tick = tick
@@ -65,6 +65,9 @@ class Quoter:
         # stop-loss: if the open position is more than this many cents/share underwater (mid vs our
         # average entry), liquidate it. 0 = off. Cuts losers without waiting for the max-hold clock.
         self.stop_loss_cents = stop_loss_cents
+        # take-profit: if the open position is more than this many cents/share in the money, close it
+        # to lock the gain and free the capital for redeployment. 0 = off.
+        self.take_profit_cents = take_profit_cents
         self.avg_entry = 0.0             # volume-weighted entry price of the OPEN position
         self.inv_since = None            # time inventory first became non-zero (for max-hold)
         self.flat_cost = 0.0; self.n_flats = 0   # spread paid crossing out of stale inventory
@@ -142,6 +145,7 @@ class Quoter:
         if self.liq_outside_band and m is not None and not in_band and self.inv != 0:
             self._do_flatten()           # price went extreme -> dump before it resolves to 0/1
         self._maybe_stop()               # stop-loss: cut the position if too far underwater
+        self._maybe_take_profit()        # take-profit: lock a winner and free the capital
         bid_open = self.want_bid and t >= self.bid_off_until and in_band
         ask_open = self.want_ask and t >= self.ask_off_until and in_band
         if bid_open or ask_open:
@@ -251,6 +255,7 @@ class Quoter:
         # track how long we've been carrying a position, and force-exit if it's too old
         self.inv_since = None if self.inv == 0 else (self.inv_since or t)
         self._maybe_stop()
+        self._maybe_take_profit()
         self._maybe_flatten(t)
 
     def _record_entry(self, dq, price):
@@ -291,6 +296,17 @@ class Quoter:
             return
         loss_c = ((self.avg_entry - m) if self.inv > 0 else (m - self.avg_entry)) * 100.0
         if loss_c >= self.stop_loss_cents - 1e-9:
+            self._do_flatten()
+
+    def _maybe_take_profit(self):
+        """Liquidate if the open position is more than take_profit_cents in the money (mid vs entry)."""
+        if self.take_profit_cents <= 0 or self.inv == 0 or self.avg_entry == 0:
+            return
+        m = self.mid()
+        if m is None:
+            return
+        gain_c = ((m - self.avg_entry) if self.inv > 0 else (self.avg_entry - m)) * 100.0
+        if gain_c >= self.take_profit_cents - 1e-9:
             self._do_flatten()
 
     def _maybe_flatten(self, t):

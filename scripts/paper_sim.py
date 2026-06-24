@@ -125,6 +125,16 @@ CONFIGS = {
     "stop_3c": dict(stop_loss_cents=3.0),
     "stop_5c": dict(stop_loss_cents=5.0),
     "fast_flat_stop3": dict(max_hold_minutes=10, stop_loss_cents=3.0),  # winner so far + stop-loss
+    # all defenses together: 10-min bail + stop quoting outside [0.10,0.90] + liquidate on exit
+    "guarded_flat": dict(max_hold_minutes=10, min_mid=0.10, max_mid=0.90, liq_outside_band=True),
+    # --- take-profit: lock winners at +X cents (frees capital to redeploy), with the guards ---
+    "take_profit_1c": dict(take_profit_cents=1.0),
+    "take_profit_2c": dict(take_profit_cents=2.0),
+    "take_profit_3c": dict(take_profit_cents=3.0),
+    "take_profit_5c": dict(take_profit_cents=5.0),
+    "tp_sl_3c": dict(take_profit_cents=3.0, stop_loss_cents=3.0),   # symmetric: lock +3c, cut -3c
+    "guarded_revolver": dict(take_profit_cents=3.0, stop_loss_cents=3.0,
+                             min_mid=0.10, max_mid=0.90, liq_outside_band=True),  # full package
 }
 
 
@@ -135,63 +145,129 @@ class PaperSim:
                  fill_model: str, capture_mult: float, out_dir: Path, rotate_minutes: float,
                  capital: float = 0.0, max_capture_share: float = 1.0,
                  quote_latency: float = 0.0, cancel_on_move: float = 0.0,
-                 max_hold_seconds: float = 0.0):
-        self.meta = token_meta
+                 max_hold_seconds: float = 0.0, min_roc: float = 0.0):
         self.size = size; self.configs = configs
+        # size <= 0  => MIN-QUALIFY mode: rest each market at its minimum reward-eligible clip
+        # (rewards_min_size), not a flat size — so the capital spreads across far more markets.
+        self.min_qualify = size <= 0
+        self.inv_cap_mult = inv_cap_mult
+        self.inv_cap = max(size, 0.0) * inv_cap_mult   # fixed-mode fallback; per-token in _ensure
         self.kw = {c: dict(CONFIGS[c]) for c in configs}   # all configs run in parallel, same feed
         self.fill_model = fill_model; self.capture_mult = capture_mult
         self.max_capture_share = max_capture_share
         self.quote_latency = quote_latency; self.cancel_on_move = cancel_on_move
         self.max_hold_seconds = max_hold_seconds
-        self.inv_cap = size * inv_cap_mult
-        # CAPITAL BUDGET: two-sided resting collateral is ~$1*size per market, so a fixed budget
-        # funds floor(capital/size) markets — we quote the top-N by reward pool (the targetable
-        # signal), matching how a real $capital book would be deployed.
-        self.capital = capital
-        self.allowed = None
-        if capital and capital > 0:
-            n = max(1, int(capital / size))
-            # only markets we can actually qualify for: our clip must clear min_incentive_size,
-            # else we score ZERO reward there. Rank the qualifiable ones by pool.
-            elig = [t for t, m in token_meta.items() if m["pool"] > 0 and m["min_size"] <= size]
-            ranked = sorted(elig, key=lambda t: token_meta[t]["pool"], reverse=True)
-            self.allowed = set(ranked[:n])
-        self.out_dir = out_dir; out_dir.mkdir(parents=True, exist_ok=True)
-        self.rotate_s = rotate_minutes * 60.0
+        # CAPITAL: each strategy runs its OWN revolving bankroll, starting at `capital`. It deploys
+        # into markets best-reward-ROC-first, only while it has free cash AND the market clears the
+        # `min_roc` hurdle (reward-$/$/day) — so we never deploy past the point of diminishing
+        # returns. Bankroll grows with reward + realized P&L; freed cash redeploys on refresh.
+        self.start_capital = capital
+        self.min_roc = min_roc
+        self.meta = token_meta
+        self.allowed: dict[str, set] = {c: set() for c in configs}    # config -> tokens it quotes
+        self.sizes: dict[str, dict] = {c: {} for c in configs}        # config -> {token: size}
+        self.q: dict[tuple, Quoter] = {}      # (config, token) -> Quoter; created lazily in _ensure
+        self.toks: set = set()                # any token at least one config quotes
         self.bids: dict[str, dict] = defaultdict(dict)
         self.asks: dict[str, dict] = defaultdict(dict)
-        self.q: dict[tuple, Quoter] = {}      # (config, token) -> Quoter (all configs, same markets)
-        self.toks: set = set()                # tokens we've instantiated quoters for
         self.last_sample: dict[str, float] = {}
         self._w = None; self._w_opened = 0.0; self._w_path = None
         self.n_snapshots = 0; self.msgs_in = 0
+        self.reallocate(token_meta)           # initial per-config allocation
+        self.out_dir = out_dir; out_dir.mkdir(parents=True, exist_ok=True)
+        self.rotate_s = rotate_minutes * 60.0
+
+    def _size_for(self, m: dict) -> float:
+        """Per-market resting size: the minimum reward-eligible clip (min mode) or fixed --size."""
+        if self.min_qualify:
+            return m.get("min_size", 0.0) or 0.0
+        return self.size
+
+    def _bankroll(self, c: str) -> float:
+        """A strategy's current equity: starting cash + reward + realized/marked trading P&L."""
+        eq = self.start_capital
+        for t in self.toks:
+            q = self.q.get((c, t))
+            if q is None:
+                continue
+            mid = q.mids[-1][1] if q.mids else 0.0
+            eq += q.reward - q.fees + q.cash + q.inv * mid
+        return eq
+
+    def reallocate(self, token_meta: dict) -> list:
+        """Per-strategy capital allocation. For each config independently:
+          1. drop markets that resolved (gone from the manifest) — flatten to free their capital,
+          2. measure free cash = bankroll − capital locked in the markets it's still in,
+          3. enter new markets best reward-ROC first, while free cash covers the clip AND the
+             market clears the min_roc hurdle (so we never deploy past diminishing returns).
+        Returns the union of all configs' tokens (what to subscribe to)."""
+        self.meta = token_meta
+        union = set()
+        for c in self.configs:
+            active = set(self.allowed.get(c, set()))
+            # 1. resolved markets: flatten and release
+            for t in list(active):
+                if t not in token_meta:
+                    q = self.q.get((c, t))
+                    if q is not None:
+                        q._do_flatten()
+                    active.discard(t); self.sizes[c].pop(t, None)
+            # 2. free cash
+            locked = sum(self.sizes[c].get(t, 0.0) for t in active)
+            free = self._bankroll(c) - locked
+            # 3. rank candidates by reward-ROC (est daily reward per $ of clip)
+            cands = []
+            for t, m in token_meta.items():
+                if t in active or m.get("pool", 0) <= 0 or m.get("v_cents", 0) <= 0:
+                    continue
+                s = self._size_for(m)
+                if s <= 0:
+                    continue
+                roc = (m["pool"] * self.max_capture_share) / s     # $reward/$/day (clip ~ $1/share)
+                if roc < self.min_roc:
+                    continue
+                cands.append((roc, t, s))
+            cands.sort(reverse=True)
+            for roc, t, s in cands:
+                if self.start_capital and self.start_capital > 0 and free < s:
+                    continue                                       # try a smaller market
+                active.add(t); self.sizes[c][t] = s; free -= s
+            self.allowed[c] = active
+            union |= active
+        return sorted(union)
 
     def _ensure(self, tok: str) -> bool:
-        """Ensure a Quoter exists for every config on this token; False if token isn't eligible."""
+        """Create a Quoter for each config that has ALLOCATED this token (per-config market sets)."""
         m = self.meta.get(tok)
         if not m or m["v_cents"] <= 0:
             return False
-        if self.allowed is not None and tok not in self.allowed:
-            return False   # outside the capital budget's top-N markets
-        if tok not in self.toks:
-            for c in self.configs:
-                kw = dict(self.kw[c])
-                if kw.pop("_optimal", False):
-                    # per-token s*: r0 = this token's per-minute reward slice at the touch
-                    s_star_c = optimal_offset_cents(m["v_cents"], m["pool"] / 1440.0, self.size)
-                    kw["quote_offset"] = s_star_c / 100.0   # cents -> price units
-                # per-config overrides for the inventory/flatten experiment (else use the globals)
-                inv_cap = self.size * kw.pop("inv_cap_mult") if "inv_cap_mult" in kw else self.inv_cap
-                mh = kw.pop("max_hold_minutes") * 60.0 if "max_hold_minutes" in kw else self.max_hold_seconds
-                self.q[(c, tok)] = Quoter(self.size, inv_cap, fill_model=self.fill_model,
-                                          capture_mult=self.capture_mult, reward_pool=m["pool"],
-                                          reward_min_size=m["min_size"], reward_v_cents=m["v_cents"],
-                                          max_capture_share=self.max_capture_share,
-                                          quote_latency=self.quote_latency,
-                                          cancel_on_move=self.cancel_on_move,
-                                          max_hold_seconds=mh, **kw)
+        any_active = False
+        for c in self.configs:
+            if tok not in self.allowed.get(c, set()):
+                continue
+            any_active = True
+            if (c, tok) in self.q:
+                continue
+            size = self.sizes[c].get(tok, 0.0)
+            if size <= 0:
+                continue
+            kw = dict(self.kw[c])
+            if kw.pop("_optimal", False):
+                s_star_c = optimal_offset_cents(m["v_cents"], m["pool"] / 1440.0, size)
+                kw["quote_offset"] = s_star_c / 100.0   # cents -> price units
+            mult = kw.pop("inv_cap_mult") if "inv_cap_mult" in kw else self.inv_cap_mult
+            inv_cap = size * mult
+            mh = kw.pop("max_hold_minutes") * 60.0 if "max_hold_minutes" in kw else self.max_hold_seconds
+            self.q[(c, tok)] = Quoter(size, inv_cap, fill_model=self.fill_model,
+                                      capture_mult=self.capture_mult, reward_pool=m["pool"],
+                                      reward_min_size=m["min_size"], reward_v_cents=m["v_cents"],
+                                      max_capture_share=self.max_capture_share,
+                                      quote_latency=self.quote_latency,
+                                      cancel_on_move=self.cancel_on_move,
+                                      max_hold_seconds=mh, **kw)
+        if any_active:
             self.toks.add(tok)
-        return True
+        return any_active
 
     def _close_current(self):
         """Close the open spool and rename .tmp -> .jsonl.gz so the uploader only ever sees a
@@ -233,13 +309,15 @@ class PaperSim:
         q2 = side_score(ba_l, mid, m["v_cents"], m["min_size"])
         self.last_sample[tok] = t
         w = self._writer(t)
-        for c in self.configs:                                   # one snapshot row per config
-            q = self.q[(c, tok)]
+        for c in self.configs:                                   # one snapshot row per config in this market
+            q = self.q.get((c, tok))
+            if q is None:
+                continue
             rw_before = q.reward
             q.credit_sample(mid, q1, q2)
             marked = q.cash + q.inv * mid - q.fees
             w.write(json.dumps({
-                "t": round(t, 1), "token": tok, "config": c, "size": self.size,
+                "t": round(t, 1), "token": tok, "config": c, "size": q.our_size,
                 "mid": round(mid, 4), "our_bid": q.our_bid, "our_ask": q.our_ask,
                 "inv": round(q.inv, 2), "marked_pnl": round(marked, 4),
                 "reward_cum": round(q.reward, 4), "reward_step": round(q.reward - rw_before, 5),
@@ -249,13 +327,14 @@ class PaperSim:
         self.n_snapshots += 1
 
     def _agg(self, cfg: str) -> dict:
-        qs = [self.q[(cfg, t)] for t in self.toks]
+        qs = [self.q[(cfg, t)] for t in self.toks if (cfg, t) in self.q]
         reward = sum(q.reward for q in qs)
         trade = sum(q.cash - q.fees + (q.inv * q.mids[-1][1] if q.mids else 0.0) for q in qs)
         # cost to flatten the CURRENT inventory now (|inv| * half-spread) — continuous, not lumpy
         liq = sum(abs(q.inv) * (q.best_ask - q.best_bid) / 2
                   for q in qs if q.best_bid is not None and q.best_ask is not None)
         return {"reward": reward, "trade": trade, "net": reward + trade,
+                "bankroll": self.start_capital + reward + trade, "n_markets": len(self.allowed.get(cfg, ())),
                 "fills": sum(len(q.fills) for q in qs), "inv": sum(abs(q.inv) for q in qs),
                 "liq_now": liq, "net_if_flat": reward + trade - liq,
                 "flat_cost": sum(q.flat_cost for q in qs), "n_flat": sum(q.n_flats for q in qs)}
@@ -265,10 +344,10 @@ class PaperSim:
         lines = [head]
         for c in self.configs:                       # one line per strategy — head-to-head
             a = self._agg(c)
-            # net_if_flat = what you'd keep liquidating now; liq = exit cost of current inventory;
-            # flat = spread already paid on forced exits
-            lines.append(f"   {c:13} reward=${a['reward']:.4f} net_if_flat=${a['net_if_flat']:.4f} "
-                         f"|inv|={a['inv']:.0f} liq=${a['liq_now']:.4f} flat=${a['flat_cost']:.4f}({a['n_flat']})")
+            # bankroll = revolving equity (start + reward + P&L); mkts = markets it currently quotes
+            lines.append(f"   {c:13} bankroll=${a['bankroll']:.2f} reward=${a['reward']:.4f} "
+                         f"net_if_flat=${a['net_if_flat']:.4f} mkts={a['n_markets']} "
+                         f"|inv|={a['inv']:.0f} flat=${a['flat_cost']:.4f}({a['n_flat']})")
         return "\n".join(lines)
 
     def process_message(self, payload):
@@ -311,8 +390,10 @@ class PaperSim:
                 p, s = _f(e.get("price")), _f(e.get("size"))
                 side = str(e.get("side") or "").upper()
                 if self._ensure(tok) and p is not None and s and side in ("BUY", "SELL"):
-                    for c in self.configs:                       # every strategy sees the same trade
-                        self.q[(c, tok)].on_trade(t, p, side, s)
+                    for c in self.configs:                       # every strategy that quotes this market
+                        q = self.q.get((c, tok))
+                        if q is not None:
+                            q.on_trade(t, p, side, s)
 
     def _feed_quote(self, tok: str, t: float):
         bb_l = [(p, s) for p, s in self.bids[tok].items() if s > 0]
@@ -321,24 +402,27 @@ class PaperSim:
             return
         bb = max(bb_l, key=lambda x: x[0]); ba = min(ba_l, key=lambda x: x[0])
         if bb[0] < ba[0]:
-            for c in self.configs:                               # every strategy sees the same book
-                self.q[(c, tok)].on_quote(t, bb[0], ba[0], bb[1], ba[1])
+            for c in self.configs:                               # every strategy that quotes this market
+                q = self.q.get((c, tok))
+                if q is not None:
+                    q.on_quote(t, bb[0], ba[0], bb[1], ba[1])
 
     def close(self):
         self._close_current()
 
     def summary(self) -> dict:
-        deployed = len(self.toks) * self.size          # ~$1*size resting collateral per market
-        out = {"size": self.size, "capital_budget": self.capital, "markets_quoted": len(self.toks),
-               "capital_deployed_est": round(deployed, 0), "snapshots": self.n_snapshots,
-               "by_config": {}}
+        out = {"size": ("min_qualify" if self.min_qualify else self.size),
+               "start_capital": self.start_capital, "markets_subscribed": len(self.toks),
+               "min_roc": self.min_roc, "snapshots": self.n_snapshots, "by_config": {}}
         for c in self.configs:
             a = self._agg(c)
-            out["by_config"][c] = {"reward": round(a["reward"], 3), "trade_pnl": round(a["trade"], 3),
-                                   "net": round(a["net"], 3), "liq_now": round(a["liq_now"], 3),
-                                   "net_if_flat": round(a["net_if_flat"], 3),
+            deployed = sum(self.sizes[c].get(t, 0.0) for t in self.allowed.get(c, ()))
+            out["by_config"][c] = {"bankroll": round(a["bankroll"], 2), "reward": round(a["reward"], 3),
+                                   "trade_pnl": round(a["trade"], 3), "net": round(a["net"], 3),
+                                   "net_if_flat": round(a["net_if_flat"], 3), "n_markets": a["n_markets"],
+                                   "capital_deployed_est": round(deployed, 0),
                                    "flatten_cost": round(a["flat_cost"], 3), "n_flatten": a["n_flat"],
-                                   "roc_on_budget": round(a["net_if_flat"] / self.capital, 5) if self.capital > 0 else None}
+                                   "return_pct": round(a["net"] / self.start_capital * 100, 3) if self.start_capital > 0 else None}
         out["best_net"] = max(self.configs, key=lambda c: self._agg(c)["net"]) if self.toks else None
         return out
 
@@ -372,18 +456,47 @@ def run_replay(sim: PaperSim, paths):
     sim.close()
 
 
-def run_live(sim: PaperSim, tokens: list[str], minutes: float):
+def run_live(sim: PaperSim, tokens: list[str], minutes: float,
+             manifest_dir: Path | None = None, refresh_minutes: float = 0.0):
     """Connect to the CLOB market WS and stream into the sim. Mirrors the collector's connection
     (app-level PING keepalive — the server's protocol ping/pong is unreliable). Live-only; not
-    exercised in CI. Requires `websocket-client`."""
+    exercised in CI. Requires `websocket-client`.
+
+    If refresh_minutes>0 and a manifest_dir is given, a background thread periodically reloads the
+    newest manifest, re-runs sim.reallocate() (so freshly created markets are added and resolved
+    ones drop / their freed capital redeploys), and forces a reconnect to resubscribe."""
+    import threading  # noqa: PLC0415
     import websocket  # noqa: PLC0415
     url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     stop_at = time.time() + minutes * 60.0
     last_hb = [time.time()]
+    state = {"tokens": list(tokens), "ws": None}
+
+    def refresher():
+        while time.time() < stop_at:
+            time.sleep(max(refresh_minutes, 1.0) * 60.0)
+            try:
+                mans = sorted(manifest_dir.glob("manifest_*.json"))
+                if not mans:
+                    continue
+                new_tokens = sim.reallocate(load_token_meta(mans[-1]))
+                if set(new_tokens) != set(state["tokens"]):
+                    added = len(set(new_tokens) - set(state["tokens"]))
+                    dropped = len(set(state["tokens"]) - set(new_tokens))
+                    state["tokens"] = new_tokens
+                    print(f"paper-sim universe refresh: {len(new_tokens)} markets "
+                          f"(+{added}/-{dropped}), ~${sim.capital_deployed:,.0f} deployed", flush=True)
+                    if state["ws"] is not None:
+                        state["ws"].close()   # reconnect -> on_open resubscribes to new_tokens
+            except Exception as exc:  # noqa: BLE001
+                print("paper-sim refresh failed:", exc, flush=True)
+
+    if refresh_minutes and manifest_dir:
+        threading.Thread(target=refresher, daemon=True).start()
 
     def on_open(ws):
-        ws.send(json.dumps({"type": "market", "assets_ids": sorted(tokens)}))
-        print(f"paper-sim subscribed to {len(tokens)} tokens", flush=True)
+        ws.send(json.dumps({"type": "market", "assets_ids": sorted(state["tokens"])}))
+        print(f"paper-sim subscribed to {len(state['tokens'])} tokens", flush=True)
 
     def on_message(ws, msg):
         try:
@@ -397,7 +510,7 @@ def run_live(sim: PaperSim, tokens: list[str], minutes: float):
 
     while time.time() < stop_at:
         ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message)
-        # app-level PING every ~10s in a side thread would go here (see collect_clob_book.run_collector)
+        state["ws"] = ws
         try:
             ws.run_forever(ping_interval=10, ping_timeout=8)
         except Exception as exc:  # noqa: BLE001
@@ -441,6 +554,10 @@ def main() -> None:
     ap.add_argument("--output-dir", type=Path, default=Path("reports/paper_sim"))
     ap.add_argument("--rotate-minutes", type=float, default=15.0)
     ap.add_argument("--minutes", type=float, default=240.0, help="live run duration")
+    ap.add_argument("--refresh-minutes", type=float, default=0.0,
+                    help="live: reload the newest manifest every N min and resubscribe (0=off)")
+    ap.add_argument("--min-roc", type=float, default=0.0,
+                    help="min reward-$/$/day to deploy into a market (capacity hurdle; 0=deploy any)")
     ap.add_argument("--tokens", nargs="*", default=[], help="token ids for --live")
     ap.add_argument("--tokens-file", type=Path, default=None)
     args = ap.parse_args()
@@ -452,11 +569,11 @@ def main() -> None:
                    args.fill_model, args.capture_mult, args.output_dir, args.rotate_minutes,
                    capital=args.capital, max_capture_share=args.max_capture_share,
                    quote_latency=args.quote_latency, cancel_on_move=args.cancel_on_move,
-                   max_hold_seconds=args.max_hold_minutes * 60.0)
-    budget_n = (int(args.capital / args.size) if args.capital > 0 else None)
-    print(f"paper-sim: configs={args.configs} size={args.size} capital=${args.capital:,.0f} "
-          f"-> top {budget_n if budget_n else 'ALL'} markets by pool; "
-          f"reward-tokens={sum(1 for m in token_meta.values() if m['pool']>0)}", flush=True)
+                   max_hold_seconds=args.max_hold_minutes * 60.0, min_roc=args.min_roc)
+    size_desc = "min-qualify" if args.size <= 0 else str(args.size)
+    print(f"paper-sim: configs={args.configs} size={size_desc} capital=${args.capital:,.0f}/strategy "
+          f"min_roc={args.min_roc} -> each strategy quotes {len(sim.allowed[args.configs[0]])} markets "
+          f"at start; reward-tokens={sum(1 for m in token_meta.values() if m['pool']>0)}", flush=True)
 
     # close the spool cleanly on systemd stop/restart (rename .tmp -> .jsonl.gz so it ships, not lost)
     import signal  # noqa: PLC0415
@@ -478,7 +595,8 @@ def main() -> None:
             # only subscribe to the budgeted top-N markets (or all reward markets if unlimited)
             tokens = sorted(sim.allowed) if sim.allowed is not None \
                 else [t for t, m in token_meta.items() if m["pool"] > 0]
-        run_live(sim, tokens, args.minutes)
+        run_live(sim, tokens, args.minutes,
+                 manifest_dir=args.manifest_dir, refresh_minutes=args.refresh_minutes)
 
     s = sim.summary()
     (args.output_dir / "paper_sim_summary.json").write_text(json.dumps(s, indent=2) + "\n")

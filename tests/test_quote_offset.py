@@ -115,6 +115,24 @@ class TestStopLoss(unittest.TestCase):
         self.assertGreater(q.inv, 0)
 
 
+class TestTakeProfit(unittest.TestCase):
+    def test_locks_in_winner(self):
+        q = Quoter(our_size=100, inventory_cap=1000, take_profit_cents=3.0)
+        q.on_quote(0.0, 0.59, 0.61, 0, 0)            # our bid 0.59
+        q.on_trade(0.1, price=0.59, side="SELL", size=100)   # long at 0.59
+        self.assertGreater(q.inv, 0)
+        q.on_quote(1.0, 0.63, 0.65, 0, 0)            # mid 0.64 -> +5c vs 0.59 (> 3c take-profit)
+        self.assertEqual(q.inv, 0.0)                  # locked in
+        self.assertEqual(q.n_flats, 1)
+
+    def test_holds_small_gain(self):
+        q = Quoter(our_size=100, inventory_cap=1000, take_profit_cents=3.0)
+        q.on_quote(0.0, 0.59, 0.61, 0, 0)
+        q.on_trade(0.1, price=0.59, side="SELL", size=100)
+        q.on_quote(1.0, 0.595, 0.615, 0, 0)          # mid 0.605 -> only +1.5c, hold
+        self.assertGreater(q.inv, 0)
+
+
 class TestPaperSimWiring(unittest.TestCase):
     def test_optimal_offset_is_interior_and_sane(self):
         import paper_sim as ps
