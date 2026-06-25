@@ -147,6 +147,14 @@ CONFIGS = {
                            min_mid=0.10, max_mid=0.90, liq_outside_band=True),
     "take_profit_5c": dict(take_profit_cents=5.0, max_hold_minutes=10,
                            min_mid=0.10, max_mid=0.90, liq_outside_band=True),
+    "take_profit_8c": dict(take_profit_cents=8.0, max_hold_minutes=10,
+                           min_mid=0.10, max_mid=0.90, liq_outside_band=True),
+    # PREDICTIVE: lean quotes with short-horizon momentum (debounced CLV) so we stop offering the
+    # side about to be run over, skew on inventory, and bank winners — avoids adverse selection at
+    # the SOURCE instead of exiting after the fact. No stop-loss (it sells losers into the move).
+    "predict_skew": dict(momentum_window=300, skew_threshold=0.004, debounce_trades=10,
+                         inv_skew=0.01, take_profit_cents=5.0, max_hold_minutes=10,
+                         min_mid=0.10, max_mid=0.90, liq_outside_band=True),
     # --- SYMMETRIC price exit sweep: lock winner at +X AND cut loser at -X (matched stop/take),
     # plus the same band + 10-min guards. Only the ±X threshold varies. ---
     "tp_sl_1c": dict(take_profit_cents=1.0, stop_loss_cents=1.0, max_hold_minutes=10,
