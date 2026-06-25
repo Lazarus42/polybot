@@ -20,6 +20,58 @@ from collections import deque
 from reward_model import order_score as _osc, q_min as _qm
 
 
+class Holder:
+    """A directional BUY-AND-HOLD strategy that duck-types the Quoter interface so it slots into the
+    same paper-sim heartbeat/aggregation. It is NOT a market maker: it crosses the spread to BUY one
+    clip when a market's mid is inside [buy_lo, buy_hi], then holds to resolution. Used for the
+    longshot (1-5c) and tail-favourite (90c+) bets. Earns no reward; P&L is pure directional.
+
+    `commit_fn(cost)->bool` lets the sim enforce the per-strategy capital budget at buy time (returns
+    False if no free capital). Resolution is handled by the sim: when the market leaves the manifest
+    it calls `_do_flatten()`, settling the position at the last mid (~0 or ~1)."""
+
+    def __init__(self, our_size, buy_lo=0.0, buy_hi=1.0, commit_fn=None, mids_maxlen=0,
+                 inventory_cap=0.0, **_ignore):
+        self.our_size = our_size; self.buy_lo = buy_lo; self.buy_hi = buy_hi
+        self.commit_fn = commit_fn or (lambda cost: True)
+        self.inventory_cap = inventory_cap
+        # Quoter-compatible fields the aggregator/heartbeat/snapshot read:
+        self.inv = self.cash = self.fees = self.reward = self.gross_spread = 0.0
+        self.flat_cost = 0.0; self.n_flats = 0
+        self.best_bid = self.best_ask = None
+        self.our_bid = self.our_ask = None
+        self.fills: list = []
+        self.mids = deque(maxlen=mids_maxlen) if mids_maxlen and mids_maxlen > 0 else []
+        self.bought = False
+
+    def mid(self):
+        return ((self.best_bid + self.best_ask) / 2
+                if (self.best_bid is not None and self.best_ask is not None) else None)
+
+    def on_quote(self, t, bid, ask, bid_size=0.0, ask_size=0.0):
+        self.best_bid, self.best_ask = bid, ask
+        m = self.mid()
+        if m is not None:
+            self.mids.append((t, m))
+        if not self.bought and m is not None and self.buy_lo <= m <= self.buy_hi and ask is not None:
+            cost = self.our_size * ask
+            if self.commit_fn(cost):                       # budget gate
+                self.inv += self.our_size; self.cash -= cost
+                self.fills.append((t, +1, m)); self.bought = True
+
+    def on_trade(self, t, price, side, size):
+        pass                                               # buy-and-hold: ignore trade flow
+
+    def credit_sample(self, *a, **k):
+        pass                                               # no liquidity reward
+
+    def _do_flatten(self):
+        """Settle the held position at the current mid (used on resolution / forced exit)."""
+        m = self.mid()
+        if self.inv != 0 and m is not None:
+            self.cash += self.inv * m; self.inv = 0.0; self.n_flats += 1
+
+
 class Quoter:
     def __init__(self, our_size: float, inventory_cap: float, maker_fee: float = 0.0,
                  mark_delay_s: float = 60.0, improve: bool = False, tick: float = 0.01,

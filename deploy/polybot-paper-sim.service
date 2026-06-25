@@ -13,10 +13,11 @@ Environment=PYTHONUNBUFFERED=1
 # Quotes the reward-eligible tokens from the latest manifest the collector wrote. Places NO real
 # orders. --minutes huge so it runs forever under systemd; restart on crash.
 ExecStart=/home/ec2-user/polymarket_exp/.venv/bin/python scripts/paper_sim.py \
-    --live --configs neutral neutral_flat30 \
-      take_profit_3c take_profit_5c take_profit_8c predict_skew \
+    --live --configs neutral neutral_ctl predict_skew predict_skew_ctl \
+      take_profit_3c take_profit_3c_ctl take_profit_5c \
+      longshot tail_favorite \
     --size 0 --capital 5000 --inv-cap-mult 5 --fill-model prorata --max-capture-share 0.10 \
-    --min-roc 0.05 --max-roc 0.30 \
+    --min-roc 0.0 --max-roc 0.10 --cull-loss 3.0 --cull-cooldown 12 \
     --quote-latency 0.2 --cancel-on-move 0.01 --max-hold-minutes 120 \
     --manifest-dir /home/ec2-user/polymarket_exp/reports/clob_capture \
     --minutes 1000000000 --rotate-minutes 15 --refresh-minutes 5 \

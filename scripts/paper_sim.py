@@ -31,7 +31,7 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from quoter import Quoter  # noqa: E402
+from quoter import Quoter, Holder  # noqa: E402
 from reward_model import side_score  # noqa: E402
 from optimal_spread import const_eta, exp_lambda, solve_optimal_spread  # noqa: E402
 
@@ -155,6 +155,15 @@ CONFIGS = {
     "predict_skew": dict(momentum_window=300, skew_threshold=0.004, debounce_trades=10,
                          inv_skew=0.01, take_profit_cents=5.0, max_hold_minutes=10,
                          min_mid=0.10, max_mid=0.90, liq_outside_band=True),
+    # --- CONTROLS: same strategies but deploy EVERYWHERE (roc_ceil=0) and never cull, so we can
+    # measure what the calm-market selection + adaptive culling actually buy us. ---
+    "neutral_ctl": dict(roc_ceil=0.0, no_cull=True),
+    "predict_skew_ctl": dict(momentum_window=300, skew_threshold=0.004, debounce_trades=10,
+                             inv_skew=0.01, take_profit_cents=5.0, max_hold_minutes=10,
+                             min_mid=0.10, max_mid=0.90, liq_outside_band=True,
+                             roc_ceil=0.0, no_cull=True),
+    "take_profit_3c_ctl": dict(take_profit_cents=3.0, max_hold_minutes=10, min_mid=0.10,
+                               max_mid=0.90, liq_outside_band=True, roc_ceil=0.0, no_cull=True),
     # --- SYMMETRIC price exit sweep: lock winner at +X AND cut loser at -X (matched stop/take),
     # plus the same band + 10-min guards. Only the ±X threshold varies. ---
     "tp_sl_1c": dict(take_profit_cents=1.0, stop_loss_cents=1.0, max_hold_minutes=10,
@@ -167,6 +176,10 @@ CONFIGS = {
                      min_mid=0.10, max_mid=0.90, liq_outside_band=True),
     "guarded_revolver": dict(take_profit_cents=3.0, stop_loss_cents=3.0, max_hold_minutes=10,
                              min_mid=0.10, max_mid=0.90, liq_outside_band=True),  # == tp_sl_3c
+    # --- DIRECTIONAL buy-and-hold bets (not market-making): buy one clip when mid is in band, hold
+    # to resolution. The mix lets us compare trading vs market-making over the week. ---
+    "longshot": dict(holder="longshot", buy_lo=0.01, buy_hi=0.05),       # bet underdogs (1-5c)
+    "tail_favorite": dict(holder="tail", buy_lo=0.90, buy_hi=0.99),      # bet favorites (90c+)
     # CRYPTO maker: quotes ONLY the 5-min up/down markets, with hard guards so we exit well before
     # each resolution — short max-hold, tight stop/take, band liquidation. Tests whether the (often
     # richer) crypto reward pools beat their fast-resolution adverse selection. Returns-per-risk play.
@@ -183,7 +196,7 @@ class PaperSim:
                  capital: float = 0.0, max_capture_share: float = 1.0,
                  quote_latency: float = 0.0, cancel_on_move: float = 0.0,
                  max_hold_seconds: float = 0.0, min_roc: float = 0.0, auto_min_roc: bool = False,
-                 max_roc: float = 0.0):
+                 max_roc: float = 0.0, cull_loss: float = 0.0, cull_cooldown: int = 12):
         self.size = size; self.configs = configs
         # size <= 0  => MIN-QUALIFY mode: rest each market at its minimum reward-eligible clip
         # (rewards_min_size), not a flat size — so the capital spreads across far more markets.
@@ -203,6 +216,11 @@ class PaperSim:
         self.min_roc = min_roc
         self.auto_min_roc = auto_min_roc      # if set, recompute min_roc each refresh to exactly fill capital
         self.max_roc = max_roc                # skip markets ABOVE this ROC (the toxic high-reward ones)
+        # adaptive culling: each refresh, drop markets bleeding worse than -cull_loss (measured net),
+        # and blacklist them for cull_cooldown refreshes so capital flows to non-toxic markets.
+        self.cull_loss = cull_loss
+        self.cull_cooldown = cull_cooldown
+        self.blacklist: dict[str, dict] = {c: {} for c in configs}   # config -> {token: refreshes_left}
         self.meta = token_meta
         self.allowed: dict[str, set] = {c: set() for c in configs}    # config -> tokens it quotes
         self.sizes: dict[str, dict] = {c: {} for c in configs}        # config -> {token: size}
@@ -262,20 +280,40 @@ class PaperSim:
 
     def _reallocate(self, token_meta: dict) -> list:
         self.meta = token_meta
+
+        def _retire(c, t):
+            """Flatten a market, fold its realized result into the running total, free its capital."""
+            q = self.q.pop((c, t), None)
+            if q is not None:
+                q._do_flatten()
+                r = self.realized[c]
+                r["reward"] += q.reward
+                r["trade"] += q.cash - q.fees                      # inv is 0 after flatten
+                r["flat_cost"] += q.flat_cost
+                r["n_flat"] += q.n_flats
+                r["fills"] += len(q.fills)
+            self.allowed[c].discard(t)
+            self.deployed_clip[c] -= self.sizes[c].pop(t, 0.0)
+
         for c in self.configs:
+            # decay the blacklist (markets become re-eligible after the cooldown)
+            for tk in list(self.blacklist[c]):
+                self.blacklist[c][tk] -= 1
+                if self.blacklist[c][tk] <= 0:
+                    del self.blacklist[c][tk]
             for t in list(self.allowed.get(c, set())):
                 if t not in token_meta:                            # resolved -> exit and free capital
-                    q = self.q.pop((c, t), None)
+                    _retire(c, t)
+                    continue
+                if self.cull_loss > 0 and not self.kw[c].get("no_cull") \
+                        and "holder" not in self.kw[c]:                    # don't cull buy-and-hold bets
+                    q = self.q.get((c, t))
                     if q is not None:
-                        q._do_flatten()
-                        r = self.realized[c]
-                        r["reward"] += q.reward
-                        r["trade"] += q.cash - q.fees              # inv is 0 after flatten
-                        r["flat_cost"] += q.flat_cost
-                        r["n_flat"] += q.n_flats
-                        r["fills"] += len(q.fills)
-                    self.allowed[c].discard(t)
-                    self.deployed_clip[c] -= self.sizes[c].pop(t, 0.0)
+                        mid = q.mids[-1][1] if q.mids else 0.0
+                        net = q.reward + q.cash - q.fees + q.inv * mid
+                        if net < -self.cull_loss:
+                            _retire(c, t)
+                            self.blacklist[c][t] = self.cull_cooldown   # sit out the cooldown
         self.toks = {t for (_c, t) in self.q}
         # subscribe to every eligible reward market; capital is committed lazily as they stream.
         # Include 5-min crypto only if some strategy opts in (allow_ephemeral).
@@ -333,6 +371,14 @@ class PaperSim:
             print(f"[roc] crypto  n={len(cry)} p50={pc(cry,.5):.3f} p90={pc(cry,.9):.3f} "
                   f"p99={pc(cry,.99):.3f} max={cry[-1]:.3f}", flush=True)
 
+    def _commit(self, c: str, tok: str, cost: float) -> bool:
+        """Budget gate for Holder buys: commit `cost` to config c if it has free capital."""
+        if self.start_capital > 0 and self.deployed_clip[c] + cost > self.start_capital:
+            return False
+        self.deployed_clip[c] += cost
+        self.sizes[c][tok] = self.sizes[c].get(tok, 0.0) + cost   # so _retire frees it on resolution
+        return True
+
     def _ensure(self, tok: str) -> bool:
         """Demand-driven allocation: only markets IN THE MANIFEST (m is not None) get quoted, and a
         strategy commits capital to one the first time it's seen streaming — if the market is durable,
@@ -348,12 +394,31 @@ class PaperSim:
         roc = (m["pool"] * self.max_capture_share) / size     # est reward $/$/day
         any_active = False
         for c in self.configs:
+            # --- directional BUY-AND-HOLD strategies (longshot / tail): create a Holder for every
+            # market; it buys one clip when the mid enters its band and self-budgets via _commit. ---
+            if "holder" in self.kw[c]:
+                if eph:                                   # holders skip the 5-min crypto churn
+                    continue
+                any_active = True
+                if (c, tok) not in self.q:
+                    cfg = self.kw[c]
+                    self.q[(c, tok)] = Holder(
+                        size, buy_lo=cfg["buy_lo"], buy_hi=cfg["buy_hi"],
+                        commit_fn=(lambda cost, _c=c, _t=tok: self._commit(_c, _t, cost)),
+                        mids_maxlen=MIDS_MAXLEN, inventory_cap=size)
+                    self.allowed[c].add(tok)
+                continue
             # crypto strategies (allow_ephemeral) quote ONLY ephemeral markets; others ONLY durable
             if eph != bool(self.kw[c].get("allow_ephemeral")):
                 continue
             if tok not in self.allowed[c]:
-                # consider committing capital to this freshly-seen market
-                if roc < self.min_roc or (self.max_roc > 0 and roc > self.max_roc):
+                # consider committing capital to this freshly-seen market. ROC band is per-config
+                # overridable (controls set roc_ceil=0 to deploy everywhere, no_cull to skip culling).
+                if tok in self.blacklist[c]:
+                    continue                              # recently culled for bleeding -> cooling off
+                floor = self.kw[c].get("roc_floor", self.min_roc)
+                ceil = self.kw[c].get("roc_ceil", self.max_roc)
+                if roc < floor or (ceil > 0 and roc > ceil):
                     continue                              # below the floor or above the toxic ceiling
                 if self.start_capital > 0:                 # capital<=0 => unlimited (quote everything)
                     avail = self.start_capital + self.realized[c]["reward"] + self.realized[c]["trade"]
@@ -364,7 +429,8 @@ class PaperSim:
             if (c, tok) in self.q:
                 continue
             kw = dict(self.kw[c])
-            kw.pop("allow_ephemeral", None)               # not a Quoter kwarg
+            for nk in ("allow_ephemeral", "roc_floor", "roc_ceil", "no_cull"):
+                kw.pop(nk, None)                          # selection knobs, not Quoter kwargs
             if kw.pop("_optimal", False):
                 s_star_c = optimal_offset_cents(m["v_cents"], m["pool"] / 1440.0, size)
                 kw["quote_offset"] = s_star_c / 100.0   # cents -> price units
@@ -723,6 +789,10 @@ def main() -> None:
                     help="auto-set the ROC hurdle each refresh to exactly fill capital with the best markets")
     ap.add_argument("--max-roc", type=float, default=0.0,
                     help="skip markets ABOVE this reward-ROC (the toxic high-reward ones); 0=no cap")
+    ap.add_argument("--cull-loss", type=float, default=0.0,
+                    help="each refresh, drop+blacklist any market whose net is below -this (0=off)")
+    ap.add_argument("--cull-cooldown", type=int, default=12,
+                    help="refreshes a culled market sits out before it can be re-entered")
     ap.add_argument("--tokens", nargs="*", default=[], help="token ids for --live")
     ap.add_argument("--tokens-file", type=Path, default=None)
     args = ap.parse_args()
@@ -735,7 +805,8 @@ def main() -> None:
                    capital=args.capital, max_capture_share=args.max_capture_share,
                    quote_latency=args.quote_latency, cancel_on_move=args.cancel_on_move,
                    max_hold_seconds=args.max_hold_minutes * 60.0, min_roc=args.min_roc,
-                   auto_min_roc=args.auto_min_roc, max_roc=args.max_roc)
+                   auto_min_roc=args.auto_min_roc, max_roc=args.max_roc,
+                   cull_loss=args.cull_loss, cull_cooldown=args.cull_cooldown)
     size_desc = "min-qualify" if args.size <= 0 else str(args.size)
     print(f"paper-sim: configs={args.configs} size={size_desc} capital=${args.capital:,.0f}/strategy "
           f"min_roc={args.min_roc} -> {len(sim.universe)} eligible markets to watch; capital committed "
