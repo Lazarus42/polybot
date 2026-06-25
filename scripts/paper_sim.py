@@ -174,7 +174,8 @@ class PaperSim:
                  fill_model: str, capture_mult: float, out_dir: Path, rotate_minutes: float,
                  capital: float = 0.0, max_capture_share: float = 1.0,
                  quote_latency: float = 0.0, cancel_on_move: float = 0.0,
-                 max_hold_seconds: float = 0.0, min_roc: float = 0.0, auto_min_roc: bool = False):
+                 max_hold_seconds: float = 0.0, min_roc: float = 0.0, auto_min_roc: bool = False,
+                 max_roc: float = 0.0):
         self.size = size; self.configs = configs
         # size <= 0  => MIN-QUALIFY mode: rest each market at its minimum reward-eligible clip
         # (rewards_min_size), not a flat size — so the capital spreads across far more markets.
@@ -193,6 +194,7 @@ class PaperSim:
         self.start_capital = capital
         self.min_roc = min_roc
         self.auto_min_roc = auto_min_roc      # if set, recompute min_roc each refresh to exactly fill capital
+        self.max_roc = max_roc                # skip markets ABOVE this ROC (the toxic high-reward ones)
         self.meta = token_meta
         self.allowed: dict[str, set] = {c: set() for c in configs}    # config -> tokens it quotes
         self.sizes: dict[str, dict] = {c: {} for c in configs}        # config -> {token: size}
@@ -343,8 +345,8 @@ class PaperSim:
                 continue
             if tok not in self.allowed[c]:
                 # consider committing capital to this freshly-seen market
-                if roc < self.min_roc:
-                    continue
+                if roc < self.min_roc or (self.max_roc > 0 and roc > self.max_roc):
+                    continue                              # below the floor or above the toxic ceiling
                 if self.start_capital > 0:                 # capital<=0 => unlimited (quote everything)
                     avail = self.start_capital + self.realized[c]["reward"] + self.realized[c]["trade"]
                     if self.deployed_clip[c] + size > avail:
@@ -711,6 +713,8 @@ def main() -> None:
                     help="min reward-$/$/day to deploy into a market (capacity hurdle; 0=deploy any)")
     ap.add_argument("--auto-min-roc", action="store_true",
                     help="auto-set the ROC hurdle each refresh to exactly fill capital with the best markets")
+    ap.add_argument("--max-roc", type=float, default=0.0,
+                    help="skip markets ABOVE this reward-ROC (the toxic high-reward ones); 0=no cap")
     ap.add_argument("--tokens", nargs="*", default=[], help="token ids for --live")
     ap.add_argument("--tokens-file", type=Path, default=None)
     args = ap.parse_args()
@@ -723,7 +727,7 @@ def main() -> None:
                    capital=args.capital, max_capture_share=args.max_capture_share,
                    quote_latency=args.quote_latency, cancel_on_move=args.cancel_on_move,
                    max_hold_seconds=args.max_hold_minutes * 60.0, min_roc=args.min_roc,
-                   auto_min_roc=args.auto_min_roc)
+                   auto_min_roc=args.auto_min_roc, max_roc=args.max_roc)
     size_desc = "min-qualify" if args.size <= 0 else str(args.size)
     print(f"paper-sim: configs={args.configs} size={size_desc} capital=${args.capital:,.0f}/strategy "
           f"min_roc={args.min_roc} -> {len(sim.universe)} eligible markets to watch; capital committed "
