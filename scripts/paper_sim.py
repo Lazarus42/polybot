@@ -119,6 +119,7 @@ CONFIGS = {
     # --- tail-control experiment: cap inventory / bail faster / lean against position ---
     "tight_inv": dict(inv_cap_mult=0.25),                 # carry at most 1/4 the inventory
     "fast_flat": dict(max_hold_minutes=10),               # bail out of a position after 10 min
+    "neutral_flat30": dict(max_hold_minutes=30),          # neutral but clear inventory every 30 min
     "fast_flat_5": dict(max_hold_minutes=5),              # even faster bail, to bracket the timing
     "skew_revert": dict(inv_skew=0.02),                   # lean quotes to shed inventory
     "tail_guard": dict(inv_cap_mult=0.25, max_hold_minutes=10, inv_skew=0.02,
@@ -158,6 +159,11 @@ CONFIGS = {
                      min_mid=0.10, max_mid=0.90, liq_outside_band=True),
     "guarded_revolver": dict(take_profit_cents=3.0, stop_loss_cents=3.0, max_hold_minutes=10,
                              min_mid=0.10, max_mid=0.90, liq_outside_band=True),  # == tp_sl_3c
+    # CRYPTO maker: quotes ONLY the 5-min up/down markets, with hard guards so we exit well before
+    # each resolution — short max-hold, tight stop/take, band liquidation. Tests whether the (often
+    # richer) crypto reward pools beat their fast-resolution adverse selection. Returns-per-risk play.
+    "crypto_mm": dict(allow_ephemeral=True, max_hold_minutes=2, stop_loss_cents=2.0,
+                      take_profit_cents=2.0, min_mid=0.10, max_mid=0.90, liq_outside_band=True),
 }
 
 
@@ -196,6 +202,8 @@ class PaperSim:
         self.realized: dict[str, dict] = {c: {"reward": 0.0, "trade": 0.0, "flat_cost": 0.0,
                                               "n_flat": 0, "fills": 0} for c in configs}
         self.deployed_clip: dict[str, float] = {c: 0.0 for c in configs}   # capital committed per config
+        # if any strategy opts into ephemeral (5-min crypto) markets, we must subscribe to them too
+        self.any_ephemeral = any(CONFIGS[c].get("allow_ephemeral") for c in configs)
         import threading  # noqa: PLC0415
         self._lock = threading.RLock()        # reentrant: serialize refresh/heartbeat vs message handling
         self.bids: dict[str, dict] = defaultdict(dict)
@@ -258,12 +266,34 @@ class PaperSim:
                     self.allowed[c].discard(t)
                     self.deployed_clip[c] -= self.sizes[c].pop(t, 0.0)
         self.toks = {t for (_c, t) in self.q}
-        # subscribe to every eligible (durable, reward-paying) manifest market; capital is committed
-        # lazily as they stream, so the subscription set is the SUPERSET we're willing to quote.
+        # subscribe to every eligible reward market; capital is committed lazily as they stream.
+        # Include 5-min crypto only if some strategy opts in (allow_ephemeral).
         self.universe = sorted(t for t, m in token_meta.items()
                                if m.get("pool", 0) > 0 and m.get("v_cents", 0) > 0
-                               and not _is_ephemeral(m.get("question", "")))
+                               and (self.any_ephemeral or not _is_ephemeral(m.get("question", ""))))
+        self._log_roc(token_meta)
         return self.universe
+
+    def _log_roc(self, token_meta: dict) -> None:
+        """Print the reward-ROC distribution (modeled $reward/$/day) for durable vs crypto markets,
+        so we can pick a sensible --min-roc and see whether crypto pools are actually richer."""
+        def roc(m):
+            s = self._size_for(m)
+            return (m["pool"] * self.max_capture_share / s) if s > 0 else 0.0
+        dur, cry = [], []
+        for _t, m in token_meta.items():
+            if m.get("pool", 0) <= 0 or m.get("v_cents", 0) <= 0:
+                continue
+            (cry if _is_ephemeral(m.get("question", "")) else dur).append(roc(m))
+        dur.sort(); cry.sort()
+        def pc(a, p):
+            return a[min(len(a) - 1, int(len(a) * p))] if a else 0.0
+        if dur:
+            print(f"[roc] durable n={len(dur)} p50={pc(dur,.5):.3f} p90={pc(dur,.9):.3f} "
+                  f"p99={pc(dur,.99):.3f} max={dur[-1]:.3f}", flush=True)
+        if cry:
+            print(f"[roc] crypto  n={len(cry)} p50={pc(cry,.5):.3f} p90={pc(cry,.9):.3f} "
+                  f"p99={pc(cry,.99):.3f} max={cry[-1]:.3f}", flush=True)
 
     def _ensure(self, tok: str) -> bool:
         """Demand-driven allocation: only markets IN THE MANIFEST (m is not None) get quoted, and a
@@ -273,14 +303,16 @@ class PaperSim:
         m = self.meta.get(tok)
         if not m or m["v_cents"] <= 0:
             return False                                  # not in the manifest -> never quote it
-        if _is_ephemeral(m.get("question", "")):
-            return False                                  # 5-min crypto churn -> skip
+        eph = _is_ephemeral(m.get("question", ""))        # 5-min crypto up/down
         size = self._size_for(m)
         if size <= 0:
             return False
         roc = (m["pool"] * self.max_capture_share) / size     # est reward $/$/day
         any_active = False
         for c in self.configs:
+            # crypto strategies (allow_ephemeral) quote ONLY ephemeral markets; others ONLY durable
+            if eph != bool(self.kw[c].get("allow_ephemeral")):
+                continue
             if tok not in self.allowed[c]:
                 # consider committing capital to this freshly-seen market
                 if roc < self.min_roc:
@@ -294,6 +326,7 @@ class PaperSim:
             if (c, tok) in self.q:
                 continue
             kw = dict(self.kw[c])
+            kw.pop("allow_ephemeral", None)               # not a Quoter kwarg
             if kw.pop("_optimal", False):
                 s_star_c = optimal_offset_cents(m["v_cents"], m["pool"] / 1440.0, size)
                 kw["quote_offset"] = s_star_c / 100.0   # cents -> price units
