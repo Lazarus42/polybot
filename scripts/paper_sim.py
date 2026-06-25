@@ -174,7 +174,7 @@ class PaperSim:
                  fill_model: str, capture_mult: float, out_dir: Path, rotate_minutes: float,
                  capital: float = 0.0, max_capture_share: float = 1.0,
                  quote_latency: float = 0.0, cancel_on_move: float = 0.0,
-                 max_hold_seconds: float = 0.0, min_roc: float = 0.0):
+                 max_hold_seconds: float = 0.0, min_roc: float = 0.0, auto_min_roc: bool = False):
         self.size = size; self.configs = configs
         # size <= 0  => MIN-QUALIFY mode: rest each market at its minimum reward-eligible clip
         # (rewards_min_size), not a flat size — so the capital spreads across far more markets.
@@ -192,6 +192,7 @@ class PaperSim:
         # returns. Bankroll grows with reward + realized P&L; freed cash redeploys on refresh.
         self.start_capital = capital
         self.min_roc = min_roc
+        self.auto_min_roc = auto_min_roc      # if set, recompute min_roc each refresh to exactly fill capital
         self.meta = token_meta
         self.allowed: dict[str, set] = {c: set() for c in configs}    # config -> tokens it quotes
         self.sizes: dict[str, dict] = {c: {} for c in configs}        # config -> {token: size}
@@ -271,8 +272,35 @@ class PaperSim:
         self.universe = sorted(t for t, m in token_meta.items()
                                if m.get("pool", 0) > 0 and m.get("v_cents", 0) > 0
                                and (self.any_ephemeral or not _is_ephemeral(m.get("question", ""))))
+        if self.auto_min_roc and self.start_capital > 0:
+            self.min_roc = self._capital_filling_cutoff(token_meta)
+            print(f"[auto-min-roc] cutoff={self.min_roc:.3f} (fills ${self.start_capital:.0f} "
+                  f"with the highest-ROC markets)", flush=True)
         self._log_roc(token_meta)
         return self.universe
+
+    def _capital_filling_cutoff(self, token_meta: dict) -> float:
+        """The ROC hurdle that just fills start_capital with the highest-ROC eligible markets:
+        sort markets by reward-$/$/day descending, accumulate their clips until the budget is used,
+        and return the ROC of the marginal market. Deploys the full budget into the BEST markets."""
+        cand = []
+        for _t, m in token_meta.items():
+            if m.get("pool", 0) <= 0 or m.get("v_cents", 0) <= 0:
+                continue
+            if not self.any_ephemeral and _is_ephemeral(m.get("question", "")):
+                continue
+            s = self._size_for(m)
+            if s <= 0:
+                continue
+            cand.append((m["pool"] * self.max_capture_share / s, s))
+        cand.sort(reverse=True)
+        cum, cutoff = 0.0, 0.0
+        for r, s in cand:
+            cutoff = r
+            cum += s
+            if cum >= self.start_capital:
+                break
+        return cutoff
 
     def _log_roc(self, token_meta: dict) -> None:
         """Print the reward-ROC distribution (modeled $reward/$/day) for durable vs crypto markets,
@@ -681,6 +709,8 @@ def main() -> None:
                     help="live: reload the newest manifest every N min and resubscribe (0=off)")
     ap.add_argument("--min-roc", type=float, default=0.0,
                     help="min reward-$/$/day to deploy into a market (capacity hurdle; 0=deploy any)")
+    ap.add_argument("--auto-min-roc", action="store_true",
+                    help="auto-set the ROC hurdle each refresh to exactly fill capital with the best markets")
     ap.add_argument("--tokens", nargs="*", default=[], help="token ids for --live")
     ap.add_argument("--tokens-file", type=Path, default=None)
     args = ap.parse_args()
@@ -692,7 +722,8 @@ def main() -> None:
                    args.fill_model, args.capture_mult, args.output_dir, args.rotate_minutes,
                    capital=args.capital, max_capture_share=args.max_capture_share,
                    quote_latency=args.quote_latency, cancel_on_move=args.cancel_on_move,
-                   max_hold_seconds=args.max_hold_minutes * 60.0, min_roc=args.min_roc)
+                   max_hold_seconds=args.max_hold_minutes * 60.0, min_roc=args.min_roc,
+                   auto_min_roc=args.auto_min_roc)
     size_desc = "min-qualify" if args.size <= 0 else str(args.size)
     print(f"paper-sim: configs={args.configs} size={size_desc} capital=${args.capital:,.0f}/strategy "
           f"min_roc={args.min_roc} -> {len(sim.universe)} eligible markets to watch; capital committed "
