@@ -178,7 +178,10 @@ CONFIGS = {
                              min_mid=0.10, max_mid=0.90, liq_outside_band=True),  # == tp_sl_3c
     # --- DIRECTIONAL buy-and-hold bets (not market-making): buy one clip when mid is in band, hold
     # to resolution. The mix lets us compare trading vs market-making over the week. ---
-    "longshot": dict(holder="longshot", buy_lo=0.01, buy_hi=0.05),       # bet underdogs (1-5c)
+    "longshot": dict(holder="longshot", buy_lo=0.01, buy_hi=0.05),       # bet underdogs (1-5c) — CONTROL
+    # FILTERED longshot from the week-1 segmentation: the edge lived in 4-5c entries in THIN books.
+    # buy only 4-5c AND in-band depth <10k. Run head-to-head vs the unfiltered `longshot` control.
+    "longshot_thin": dict(holder="longshot", buy_lo=0.04, buy_hi=0.05, max_book_depth=10000.0),
     "tail_favorite": dict(holder="tail", buy_lo=0.90, buy_hi=0.99),      # bet favorites (90c+)
     # CRYPTO maker: quotes ONLY the 5-min up/down markets, with hard guards so we exit well before
     # each resolution — short max-hold, tight stop/take, band liquidation. Tests whether the (often
@@ -404,6 +407,8 @@ class PaperSim:
                     cfg = self.kw[c]
                     self.q[(c, tok)] = Holder(
                         size, buy_lo=cfg["buy_lo"], buy_hi=cfg["buy_hi"],
+                        max_book_depth=cfg.get("max_book_depth", 0.0),
+                        max_fill_slippage=cfg.get("max_fill_slippage", 0.5),
                         commit_fn=(lambda cost, _c=c, _t=tok: self._commit(_c, _t, cost)),
                         mids_maxlen=MIDS_MAXLEN, inventory_cap=size)
                     self.allowed[c].add(tok)
@@ -617,10 +622,18 @@ class PaperSim:
             return
         bb = max(bb_l, key=lambda x: x[0]); ba = min(ba_l, key=lambda x: x[0])
         if bb[0] < ba[0]:
+            # in-band depth = same measure the snapshot logs (q_bid_book+q_ask_book); lets the
+            # liquidity-gated longshot decide whether the book is thin enough to buy.
+            depth = None
+            m = self.meta.get(tok)
+            if m:
+                mid = (bb[0] + ba[0]) / 2.0
+                depth = side_score(bb_l, mid, m["v_cents"], m["min_size"]) \
+                    + side_score(ba_l, mid, m["v_cents"], m["min_size"])
             for c in self.configs:                               # every strategy that quotes this market
                 q = self.q.get((c, tok))
                 if q is not None:
-                    q.on_quote(t, bb[0], ba[0], bb[1], ba[1])
+                    q.on_quote(t, bb[0], ba[0], bb[1], ba[1], book_depth=depth, ask_levels=ba_l)
 
     def close(self):
         self._close_current()

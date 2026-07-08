@@ -31,10 +31,16 @@ class Holder:
     it calls `_do_flatten()`, settling the position at the last mid (~0 or ~1)."""
 
     def __init__(self, our_size, buy_lo=0.0, buy_hi=1.0, commit_fn=None, mids_maxlen=0,
-                 inventory_cap=0.0, **_ignore):
+                 inventory_cap=0.0, max_book_depth=0.0, max_fill_slippage=0.5, **_ignore):
         self.our_size = our_size; self.buy_lo = buy_lo; self.buy_hi = buy_hi
         self.commit_fn = commit_fn or (lambda cost: True)
         self.inventory_cap = inventory_cap
+        # only buy where in-band book depth (side_score bid+ask, same measure as the snapshot's
+        # q_bid_book+q_ask_book) is below this. 0 = disabled. The analysis edge lived in <10k books.
+        self.max_book_depth = max_book_depth
+        # walk-the-book fill: pay progressively worse asks up to touch*(1+this); models depth slippage
+        # and partial fills in thin books (the realism that stops unrealistic compounding).
+        self.max_fill_slippage = max_fill_slippage
         # Quoter-compatible fields the aggregator/heartbeat/snapshot read:
         self.inv = self.cash = self.fees = self.reward = self.gross_spread = 0.0
         self.flat_cost = 0.0; self.n_flats = 0
@@ -48,16 +54,40 @@ class Holder:
         return ((self.best_bid + self.best_ask) / 2
                 if (self.best_bid is not None and self.best_ask is not None) else None)
 
-    def on_quote(self, t, bid, ask, bid_size=0.0, ask_size=0.0):
+    def _walk_fill(self, touch_ask, ask_levels):
+        """Fill up to our_size by consuming successive ask levels (size-weighted avg price), stopping
+        at touch*(1+max_fill_slippage). Returns (shares_filled, cash_spent). Thin books -> worse avg
+        price and possibly a PARTIAL fill. Falls back to full fill at touch if no ladder is supplied
+        (offline replay / unit tests), preserving old behavior there."""
+        if not ask_levels:
+            return self.our_size, self.our_size * touch_ask
+        limit = touch_ask * (1.0 + self.max_fill_slippage)
+        remaining, spent, filled = self.our_size, 0.0, 0.0
+        for price, size in sorted(ask_levels, key=lambda x: x[0]):
+            if size <= 0 or price > limit:
+                break
+            take = min(remaining, size)
+            spent += take * price; filled += take; remaining -= take
+            if remaining <= 1e-9:
+                break
+        return filled, spent
+
+    def on_quote(self, t, bid, ask, bid_size=0.0, ask_size=0.0, book_depth=None, ask_levels=None):
         self.best_bid, self.best_ask = bid, ask
         m = self.mid()
         if m is not None:
             self.mids.append((t, m))
         if not self.bought and m is not None and self.buy_lo <= m <= self.buy_hi and ask is not None:
-            cost = self.our_size * ask
-            if self.commit_fn(cost):                       # budget gate
-                self.inv += self.our_size; self.cash -= cost
-                self.fills.append((t, +1, m)); self.bought = True
+            # liquidity gate: if a depth cap is set, only buy in books thinner than it. If the cap is
+            # on but depth wasn't supplied, don't buy (can't confirm the book is thin).
+            if self.max_book_depth > 0 and not (book_depth is not None and book_depth < self.max_book_depth):
+                return
+            shares, spent = self._walk_fill(ask, ask_levels)   # walk-the-book: real slippage + partials
+            if shares <= 1e-9:
+                return
+            if self.commit_fn(spent):                          # budget gate on actual spend
+                self.inv += shares; self.cash -= spent
+                self.fills.append((t, +1, spent / shares)); self.bought = True
 
     def on_trade(self, t, price, side, size):
         pass                                               # buy-and-hold: ignore trade flow
@@ -167,7 +197,7 @@ class Quoter:
         var = (self.vol_sumsq - self.vol_sum * self.vol_sum / n) / (n - 1)
         return var ** 0.5 if var > 0 else 0.0
 
-    def on_quote(self, t, bid, ask, bid_size=0.0, ask_size=0.0):
+    def on_quote(self, t, bid, ask, bid_size=0.0, ask_size=0.0, book_depth=None, ask_levels=None):  # holder-only kwargs ignored
         self.n_quotes += 1
         self.best_bid, self.best_ask = bid, ask
         m = self.mid()
