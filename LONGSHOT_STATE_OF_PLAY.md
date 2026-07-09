@@ -158,9 +158,13 @@ post-friction edge with no assumption. Let both run ~a week and compare.
 
 1. **Out-of-sample check.** Re-run on fresh weeks as they accumulate — does 4–5¢ ∧ <10k hold up, or
    was it a two-week artifact? This is the single most important validation.
-2. **Bankroll-level return + capacity.** Add a concurrent/peak-deployed-capital and turnover estimate
-   so we can state the actual period return on standing capital and the capacity ceiling (how much
-   thin 4–5¢ inventory is buyable at once).
+2. **Bankroll-level return + capacity.** ANSWERED 2026-07-09 (pre-registered): CONFIRMED
+   capacity-constrained — median $ in-band ask depth across concurrently-open cell markets ≈ $4.8k
+   (≈ the bankroll, and that is an optimistic upper bound); sim 1-clip footprint ~$2.1k median;
+   deployment is a ~$5.2k/day flow with ~1.8h median holds, bound by per-market clip size (median
+   eligible market: ~$3 of in-band ask depth at entry).
+   → `reports/eval/longshot-capacity-ceiling-2026-07-09.md`. Marginal slippage at >1-clip size:
+   forward `size_mult` probes (2026-07-09 expansion).
 3. **Fix manifest coverage** so category/horizon slices aren't half-`unknown` (capture manifests for
    non-reward penny markets, or revisit token matching).
 4. **Profit-taking revisited?** Earlier explored and reverted; may still be worth testing whether

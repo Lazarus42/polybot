@@ -61,6 +61,14 @@ bet, tested forward with a paper simulator that replays the live order book. The
   books). Slippage stress: breakeven ~2.1¢/share, realistic thin-book fills roughly halve the edge →
   plan on ~10–15% ROC, not 21.5%. → `LONGSHOT_STATE_OF_PLAY.md` (has the tables, caveats, and the
   methodology fixes: the per-position P&L bug and ROC normalization).
+- **Capacity ceiling of the filtered longshot — CONFIRMED capacity-constrained (2026-07-09,
+  pre-registered, analysis-only).** On the frozen pre-restart window, even the optimistic upper
+  bound on instantaneously buyable cell inventory (median B_t ≈ $4.8k, marginal vs the $5k
+  threshold) ≈ the bankroll; the median eligible market offers ~$3 of in-band ask depth at entry;
+  the sim's 1-clip sizing only ever tied up ~$2.1k median. Deployment is a FLOW (~$5.2k/day of new
+  entries, ~1.8h median hold), not a stock — the binding constraint is per-market clip size.
+  Never quote per-cycle ROC as bankroll return. → `reports/eval/longshot-capacity-ceiling-2026-07-09.md`
+  (+ prereg in `reports/prereg/`); forward `size_mult` probes measure marginal slippage directly.
 
 ## 3. Tooling the loop uses
 
@@ -132,8 +140,9 @@ Enforcement rules the loop must self-check every cycle:
 ## 5. Open frontier — candidate experiments for the loop
 
 1. **Out-of-sample validation of 4–5¢ ∧ <10k longshot** (the 2026-07-22 eval). Single most important.
-2. **Capacity / concurrent-capital ceiling** for the longshot filter — how much thin 4–5¢ inventory is
-   buyable at once; the real bankroll-level return vs the per-cycle ROC.
+2. ~~**Capacity / concurrent-capital ceiling**~~ — ANSWERED 2026-07-09 (capacity-constrained; see §2
+   and `reports/eval/longshot-capacity-ceiling-2026-07-09.md`). Remaining sub-question — realized
+   marginal slippage at >1-clip size — handed to the forward `size_mult` probes.
 3. **Reward-harvesting MM deployment taxonomy** — which market tags (category/horizon/neg_risk/pool)
    is maker-reward net-positive on? That taxonomy becomes the deployment filter.
 4. **Fix manifest coverage** so category/horizon slices aren't half-`unknown`.
