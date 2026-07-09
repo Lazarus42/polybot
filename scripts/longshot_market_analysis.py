@@ -191,12 +191,27 @@ def collect_clips(paper_glob: str, tags: dict, resolved_lo: float, resolved_hi: 
         m = tags.get(tok, {})
         last_mid = p["l_mid"]
         resolved = last_mid is not None and (last_mid <= resolved_lo or last_mid >= resolved_hi)
+        # horizon AT ENTRY (ex-ante, look-ahead-free): the merged tags artifact records when the
+        # token was last seen in a manifest and its horizon_days at that moment, so the market's
+        # end date ~= last_seen + horizon_days and entry horizon = end date - entry time. The raw
+        # manifest-tag horizon_days (last-seen) is short-biased for anything watched to its end.
+        h_entry = None
+        ls, hd = m.get("last_seen"), m.get("horizon_days")
+        if ls and hd is not None:
+            try:
+                from datetime import datetime, timezone
+                end_est = datetime.strptime(ls, "%Y%m%dT%H%M%SZ").replace(
+                    tzinfo=timezone.utc).timestamp() + hd * 86400.0
+                h_entry = (end_est - p["e_t"]) / 86400.0
+            except Exception:
+                h_entry = None
         clips.append({
             "token": tok, "entry": p["e_mid"], "pnl": p["l_pnl"], "cost": p["e_cost"] or 0.0,
             "e_t": p["e_t"], "l_t": p["l_t"], "e_ask": p["e_ask"],
             "last_mid": last_mid, "resolved": resolved, "win": p["l_pnl"] > 0,
             "category": m.get("category", "unknown"), "neg_risk": bool(m.get("neg_risk")),
             "horizon_bucket": bucket(m.get("horizon_days"), HORIZON_EDGES, HORIZON_LABELS),
+            "horizon_entry_bucket": bucket(h_entry, HORIZON_EDGES, HORIZON_LABELS),
             "competitive_bucket": bucket(m.get("competitive"), COMP_EDGES, COMP_LABELS),
             "pool_bucket": bucket(m.get("reward_daily_est"), POOL_EDGES, POOL_LABELS),
             "spread_bucket": bucket(m.get("spread"), SPREAD_EDGES, SPREAD_LABELS),
@@ -342,6 +357,7 @@ def main():
         "liquidity": lambda c: c["liq_bucket"],
         "entry_price": lambda c: c["entry_bucket"],
         "horizon": lambda c: c["horizon_bucket"],
+        "horizon_at_entry": lambda c: c["horizon_entry_bucket"],
         "neg_risk": lambda c: "neg_risk" if c["neg_risk"] else "binary",
         "competitive": lambda c: c["competitive_bucket"],
         "reward_pool": lambda c: c["pool_bucket"],

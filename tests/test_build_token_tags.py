@@ -61,6 +61,46 @@ class TestMergeManifests(unittest.TestCase):
         self.assertEqual(out["token_meta"]["A"]["category"], "sports")
 
 
+class TestHorizonAtEntry(unittest.TestCase):
+    def test_entry_horizon_derived_from_last_seen(self):
+        import longshot_market_analysis as lma
+        rows = [
+            {"t": 1783000000.0, "token": "A", "config": "longshot", "mid": 0.045, "inv": 80.0,
+             "marked_pnl": 0.0, "q_bid_book": 100.0, "q_ask_book": 100.0},
+        ]
+        # last_seen 2026-07-08T00:00Z (epoch 1783555200... use strftime round trip) + 2d horizon
+        from datetime import datetime, timezone
+        last_seen_epoch = 1783600000.0
+        stamp = datetime.fromtimestamp(last_seen_epoch, tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        # re-derive the epoch the parser will see (stamp truncates seconds precision)
+        stamp_epoch = datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(
+            tzinfo=timezone.utc).timestamp()
+        tags = {"A": {"last_seen": stamp, "horizon_days": 2.0, "category": "sports"}}
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "paper_h_1_1.jsonl.gz"
+            with gzip.open(p, "wt") as fh:
+                for r in rows:
+                    fh.write(json.dumps(r) + "\n")
+            clips = lma.collect_clips(str(Path(td) / "paper_*.jsonl.gz"), tags, 0.10, 0.90)
+        self.assertEqual(len(clips), 1)
+        expected_days = (stamp_epoch + 2.0 * 86400.0 - 1783000000.0) / 86400.0
+        # bucket edges [3, 14, 60]: expected ~8.9d -> '3-14d'
+        self.assertEqual(clips[0]["horizon_entry_bucket"],
+                         "3-14d" if 3 <= expected_days < 14 else "assert-recheck")
+
+    def test_entry_horizon_unknown_without_tags(self):
+        import longshot_market_analysis as lma
+        rows = [{"t": 100.0, "token": "A", "config": "longshot", "mid": 0.045, "inv": 80.0,
+                 "marked_pnl": 0.0, "q_bid_book": 1.0, "q_ask_book": 1.0}]
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "paper_h_1_1.jsonl.gz"
+            with gzip.open(p, "wt") as fh:
+                for r in rows:
+                    fh.write(json.dumps(r) + "\n")
+            clips = lma.collect_clips(str(Path(td) / "paper_*.jsonl.gz"), {}, 0.10, 0.90)
+        self.assertEqual(clips[0]["horizon_entry_bucket"], "unknown")
+
+
 class TestLoadTagsGz(unittest.TestCase):
     def test_load_manifest_tags_reads_gz_artifact(self):
         with tempfile.TemporaryDirectory() as td:
