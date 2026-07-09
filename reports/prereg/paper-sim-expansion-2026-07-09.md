@@ -120,8 +120,9 @@ the eval window remains --since 1783468800 spanning both pids. The 07-22 eval MU
 
 ## Addendum — deploy record (filled immediately after deploy; no results seen)
 
-- DEPLOY_EPOCH: **1783592987** (2026-07-09 10:29:47 UTC; sim pid 2460829). All expansion evals use
-  `--since 1783592987`.
+- DEPLOY_EPOCH: **1783596212** (2026-07-09 11:23:32 UTC — re-based by the same-day
+  longshot_thin_0_3d amendment redeploy; the 10:29:47 stub window was never analyzed). All
+  expansion evals use `--since 1783596212`.
 - Deploy verification (P&L-blind, 2026-07-09): service `active`; 0 Tracebacks in the journal at
   +0s and +90s; all 26 configs present in the live snapshot stream (config-name extraction only —
   no P&L fields read). Gated variants show smaller universes than their controls in the expected
