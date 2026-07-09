@@ -113,5 +113,10 @@ the eval window remains --since 1783468800 spanning both pids. The 07-22 eval MU
 
 ## Addendum — deploy record (filled immediately after deploy; no results seen)
 
-- DEPLOY_EPOCH: _TBD_
-- Deploy verification: _TBD (P&L-blind: service active, new config names in snapshots, no traceback)_
+- DEPLOY_EPOCH: **1783592987** (2026-07-09 10:29:47 UTC; sim pid 2460829). All expansion evals use
+  `--since 1783592987`.
+- Deploy verification (P&L-blind, 2026-07-09): service `active`; 0 Tracebacks in the journal at
+  +0s and +90s; all 26 configs present in the live snapshot stream (config-name extraction only —
+  no P&L fields read). Gated variants show smaller universes than their controls in the expected
+  direction (e.g. fav_politics 820 rows vs fav_hold 2,508; longshot_thin_norewards 60 —
+  tiny-pool markets are rare), i.e. the gates demonstrably bind.
