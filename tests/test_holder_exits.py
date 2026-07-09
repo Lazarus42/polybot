@@ -89,6 +89,15 @@ class TestPerConfigMarketGate(unittest.TestCase):
             self.assertTrue(sim._ensure("T"))
             self.assertIn(("h_gate", "T"), sim.q)
 
+    def test_min_horizon_gate_blocks_near_market_and_unknown_passes(self):
+        cfgs = {"nh_gate": dict(holder="tail", buy_lo=0.55, buy_hi=0.90, min_horizon_days=7.0)}
+        with tempfile.TemporaryDirectory() as td:
+            sim = self._sim(Path(td), cfgs)
+            sim.meta["T"]["horizon_days"] = 2.0
+            self.assertFalse(sim._ensure("T"))                 # 2d < 7d min gate
+            sim.meta["T"]["horizon_days"] = None               # unknown horizon must PASS
+            self.assertTrue(sim._ensure("T"))
+
     def test_category_gate(self):
         cfgs = {"c_gate": dict(holder="longshot", buy_lo=0.01, buy_hi=0.05,
                                categories={"sports", "esports"})}

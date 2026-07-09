@@ -393,8 +393,14 @@ class PaperSim:
         profitable, so a hard gate on unknown would discard real P&L for a data-coverage reason).
         `categories`: quote only these categories ('unknown' is a listable value for untagged)."""
         cfg = self.kw[c]
+        h = m.get("horizon_days")
         mh = cfg.get("max_horizon_days")
-        if mh and m.get("horizon_days") is not None and m["horizon_days"] > mh:
+        if mh and h is not None and h > mh:
+            return False
+        # min gate for the buy-favorites family: the calibration edge is a LONG-horizon effect and
+        # vanishes near resolution, so skip markets KNOWN to resolve soon (unknown passes, as above).
+        nh = cfg.get("min_horizon_days")
+        if nh and h is not None and h < nh:
             return False
         cats = cfg.get("categories")
         if cats and (m.get("category") or "unknown") not in cats:
@@ -461,7 +467,7 @@ class PaperSim:
                 continue
             kw = dict(self.kw[c])
             for nk in ("allow_ephemeral", "roc_floor", "roc_ceil", "no_cull",
-                       "max_horizon_days", "categories"):
+                       "max_horizon_days", "min_horizon_days", "categories"):
                 kw.pop(nk, None)                          # selection knobs, not Quoter kwargs
             if kw.pop("_optimal", False):
                 s_star_c = optimal_offset_cents(m["v_cents"], m["pool"] / 1440.0, size)
