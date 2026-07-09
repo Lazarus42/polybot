@@ -13,6 +13,10 @@ archive.tar.xz
 archive/processed/underdog_events/fills_sorted.parquet
 
 # Reports / outputs (keep if you want; remove if you want tracked)
-reports/
+# reports/* (not reports/) so the prereg/eval negations below can re-include those dirs —
+# git cannot re-include anything under a directory that is itself excluded.
+reports/*
+!reports/prereg/
+!reports/eval/
 data/
 *.pem
