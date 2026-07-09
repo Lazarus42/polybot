@@ -124,12 +124,13 @@ def _process_file(path: str):
                 p = part.get(tok)
                 if p is None:
                     p = part[tok] = {"e_t": None, "e_mid": None, "e_liq": None, "e_cost": None,
-                                     "l_t": -1.0, "l_pnl": 0.0, "l_mid": None}
+                                     "e_ask": None, "l_t": -1.0, "l_pnl": 0.0, "l_mid": None}
                 inv = r.get("inv") or 0.0
                 mid = r.get("mid")
                 if p["e_t"] is None and inv > 0 and mid is not None:          # first buy in this file
                     p["e_t"] = t; p["e_mid"] = mid
                     p["e_liq"] = (r.get("q_bid_book") or 0.0) + (r.get("q_ask_book") or 0.0)
+                    p["e_ask"] = r.get("q_ask_book")   # ask-side in-band depth at entry (capacity)
                     p["e_cost"] = inv * mid          # capital deployed on the clip (shares x price)
                 if t >= p["l_t"]:                                             # latest row in this file
                     p["l_t"] = t; p["l_pnl"] = r.get("marked_pnl") or 0.0; p["l_mid"] = mid
@@ -141,8 +142,8 @@ def _process_file(path: str):
 def _merge(dst: dict, src: dict):
     """Merge one file's partial into the accumulator: keep the earliest entry and the latest row."""
     if src["e_t"] is not None and (dst["e_t"] is None or src["e_t"] < dst["e_t"]):
-        dst["e_t"], dst["e_mid"], dst["e_liq"], dst["e_cost"] = \
-            src["e_t"], src["e_mid"], src["e_liq"], src["e_cost"]
+        dst["e_t"], dst["e_mid"], dst["e_liq"], dst["e_cost"], dst["e_ask"] = \
+            src["e_t"], src["e_mid"], src["e_liq"], src["e_cost"], src["e_ask"]
     if src["l_t"] > dst["l_t"]:
         dst["l_t"], dst["l_pnl"], dst["l_mid"] = src["l_t"], src["l_pnl"], src["l_mid"]
 
@@ -186,6 +187,7 @@ def collect_clips(paper_glob: str, tags: dict, resolved_lo: float, resolved_hi: 
         resolved = last_mid is not None and (last_mid <= resolved_lo or last_mid >= resolved_hi)
         clips.append({
             "token": tok, "entry": p["e_mid"], "pnl": p["l_pnl"], "cost": p["e_cost"] or 0.0,
+            "e_t": p["e_t"], "l_t": p["l_t"], "e_ask": p["e_ask"],
             "last_mid": last_mid, "resolved": resolved, "win": p["l_pnl"] > 0,
             "category": m.get("category", "unknown"), "neg_risk": bool(m.get("neg_risk")),
             "horizon_bucket": bucket(m.get("horizon_days"), HORIZON_EDGES, HORIZON_LABELS),
