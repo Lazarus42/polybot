@@ -51,9 +51,12 @@ def load_events(patterns, max_events):
                 except json.JSONDecodeError:
                     continue
                 events.append(e)
-                ts = ps._ts(e.get("timestamp")); rv = _recv_epoch(e.get("_recv_ts"))
-                if ts and rv:
-                    feed_lat.append(rv - ts)
+                # feed latency ONLY from real-time price_change events — book snapshots carry each
+                # market's stale last-update time, not the message time, which poisons the metric.
+                if (e.get("event_type") or e.get("type")) == "price_change":
+                    ts = ps._ts(e.get("timestamp")); rv = _recv_epoch(e.get("_recv_ts"))
+                    if ts and rv and -5 < (rv - ts) < 30:    # sane window; drop snapshot/clock junk
+                        feed_lat.append(rv - ts)
                 if max_events and len(events) >= max_events:
                     return events, feed_lat
     return events, feed_lat
