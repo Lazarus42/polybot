@@ -190,3 +190,4 @@ hypothesis, its control, its pre-registered success criterion, and its evaluatio
 | `reports/MM_REWARD_FINDINGS.md` | market-making + reward-harvesting findings |
 | `reports/CAPACITY_STRATEGY_NOTES.md`, `reports/OBJECTIVE_REDESIGN_RESULTS.md` | capacity + objective-redesign detail |
 | `STATUS.md` | older project status (2026-06-22, pre-paper-sim — partly stale) |
+| `reports/research/session-2026-07-09.md` | **day-1 loop session log** — everything done 2026-07-09, live state, resume instructions, session id |
