@@ -128,6 +128,18 @@ Holder now fills by walking the real ask ladder (worse average price + partial f
 deep books unchanged), so `longshot_thin`'s live P&L vs the `longshot` control measures the true
 post-friction edge with no assumption. Let both run ~a week and compare.
 
+### 4b. 2026-07-09 correction — entry-bucket smearing (read before quoting §3/§4 numbers)
+
+After the manifest-coverage fix, a P&L-attribution bug surfaced: entries were bucketed on the mid
+at the first post-fill snapshot (up to a minute after the fill), which smears in-progress pops
+into the high entry buckets. With true fill prices (recovered exactly from marked_pnl; overall
+window P&L unchanged), the headline cell corrects to **≥4¢-fill ∧ <10k = +15.2% ROC / +$8,659 /
+n=13,306** (from +21.5% / +$14,194 / 9,153), with a true average fill of 6.1¢. Honest planning
+number after the §4a slippage haircut: **~7–8% per-cycle ROC**. Ex-ante horizon (new
+`horizon_at_entry` axis) concentrates the edge in **<3 days to resolution**; 3–14d is negative.
+The pre-registered 07-22 criterion is unchanged — this corrects the in-sample benchmark, not the
+bar. Details: `reports/research/mining-insample-2026-07-09.md` addendum.
+
 ## 5. How to read the numbers (caveats)
 
 - **ROC is per dollar-cycle, not period return on bankroll.** The "$66,100 capital deployed" for the

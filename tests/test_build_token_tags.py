@@ -101,6 +101,26 @@ class TestHorizonAtEntry(unittest.TestCase):
         self.assertEqual(clips[0]["horizon_entry_bucket"], "unknown")
 
 
+class TestTrueEntryRecovery(unittest.TestCase):
+    def test_entry_price_recovered_from_marked_pnl(self):
+        import longshot_market_analysis as lma
+        # fill at 0.045; by the first snapshot the mid has popped to 0.10, so
+        # marked_pnl = 80*(0.10-0.045) = 4.4 and the true entry must be recovered as 0.045
+        rows = [{"t": 100.0, "token": "A", "config": "longshot", "mid": 0.10, "inv": 80.0,
+                 "marked_pnl": 4.4, "q_bid_book": 100.0, "q_ask_book": 100.0}]
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "paper_h_1_1.jsonl.gz"
+            with gzip.open(p, "wt") as fh:
+                for r in rows:
+                    fh.write(json.dumps(r) + "\n")
+            clips = lma.collect_clips(str(Path(td) / "paper_*.jsonl.gz"), {}, 0.10, 0.90)
+        c = clips[0]
+        self.assertAlmostEqual(c["entry"], 0.045)
+        self.assertAlmostEqual(c["entry_mid_snapshot"], 0.10)
+        self.assertAlmostEqual(c["cost"], 80.0 * 0.045)
+        self.assertEqual(c["entry_bucket"], "4-5c")      # bucketed on FILL, not the popped mid
+
+
 class TestLoadTagsGz(unittest.TestCase):
     def test_load_manifest_tags_reads_gz_artifact(self):
         with tempfile.TemporaryDirectory() as td:

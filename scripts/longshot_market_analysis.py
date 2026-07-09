@@ -130,14 +130,21 @@ def _process_file(path: str):
                 p = part.get(tok)
                 if p is None:
                     p = part[tok] = {"e_t": None, "e_mid": None, "e_liq": None, "e_cost": None,
-                                     "e_ask": None, "l_t": -1.0, "l_pnl": 0.0, "l_mid": None}
+                                     "e_ask": None, "e_inv": 0.0, "e_pnl": 0.0,
+                                     "l_t": -1.0, "l_pnl": 0.0, "l_mid": None}
                 inv = r.get("inv") or 0.0
                 mid = r.get("mid")
                 if p["e_t"] is None and inv > 0 and mid is not None:          # first buy in this file
                     p["e_t"] = t; p["e_mid"] = mid
                     p["e_liq"] = (r.get("q_bid_book") or 0.0) + (r.get("q_ask_book") or 0.0)
                     p["e_ask"] = r.get("q_ask_book")   # ask-side in-band depth at entry (capacity)
-                    p["e_cost"] = inv * mid          # capital deployed on the clip (shares x price)
+                    p["e_inv"] = inv
+                    p["e_pnl"] = r.get("marked_pnl") or 0.0
+                    # true FILL cost, not snapshot-mid cost: the first row with inv>0 is up to a
+                    # minute after the fill, and marked_pnl = inv*mid - cost, so cost is exact even
+                    # if the mid already moved (bucketing on the moved mid smears pop-winners into
+                    # high entry buckets — the bias this recovers from).
+                    p["e_cost"] = inv * mid - p["e_pnl"]
                 if t >= p["l_t"]:                                             # latest row in this file
                     p["l_t"] = t; p["l_pnl"] = r.get("marked_pnl") or 0.0; p["l_mid"] = mid
     except Exception:
@@ -148,8 +155,8 @@ def _process_file(path: str):
 def _merge(dst: dict, src: dict):
     """Merge one file's partial into the accumulator: keep the earliest entry and the latest row."""
     if src["e_t"] is not None and (dst["e_t"] is None or src["e_t"] < dst["e_t"]):
-        dst["e_t"], dst["e_mid"], dst["e_liq"], dst["e_cost"], dst["e_ask"] = \
-            src["e_t"], src["e_mid"], src["e_liq"], src["e_cost"], src["e_ask"]
+        for k in ("e_t", "e_mid", "e_liq", "e_cost", "e_ask", "e_inv", "e_pnl"):
+            dst[k] = src[k]
     if src["l_t"] > dst["l_t"]:
         dst["l_t"], dst["l_pnl"], dst["l_mid"] = src["l_t"], src["l_pnl"], src["l_mid"]
 
@@ -205,8 +212,12 @@ def collect_clips(paper_glob: str, tags: dict, resolved_lo: float, resolved_hi: 
                 h_entry = (end_est - p["e_t"]) / 86400.0
             except Exception:
                 h_entry = None
+        # entry = TRUE average fill price recovered from the entry row's cumulative P&L
+        # (mid - marked_pnl/inv); falls back to the snapshot mid if inventory is degenerate.
+        true_entry = (p["e_mid"] - p["e_pnl"] / p["e_inv"]) if p["e_inv"] > 1e-9 else p["e_mid"]
         clips.append({
-            "token": tok, "entry": p["e_mid"], "pnl": p["l_pnl"], "cost": p["e_cost"] or 0.0,
+            "token": tok, "entry": true_entry, "entry_mid_snapshot": p["e_mid"],
+            "pnl": p["l_pnl"], "cost": max(p["e_cost"] or 0.0, 0.0),
             "e_t": p["e_t"], "l_t": p["l_t"], "e_ask": p["e_ask"],
             "last_mid": last_mid, "resolved": resolved, "win": p["l_pnl"] > 0,
             "category": m.get("category", "unknown"), "neg_risk": bool(m.get("neg_risk")),
@@ -215,7 +226,7 @@ def collect_clips(paper_glob: str, tags: dict, resolved_lo: float, resolved_hi: 
             "competitive_bucket": bucket(m.get("competitive"), COMP_EDGES, COMP_LABELS),
             "pool_bucket": bucket(m.get("reward_daily_est"), POOL_EDGES, POOL_LABELS),
             "spread_bucket": bucket(m.get("spread"), SPREAD_EDGES, SPREAD_LABELS),
-            "entry_bucket": bucket(p["e_mid"], ENTRY_EDGES, ENTRY_LABELS),
+            "entry_bucket": bucket(true_entry, ENTRY_EDGES, ENTRY_LABELS),
             "liq_bucket": bucket(p["e_liq"], LIQ_EDGES, LIQ_LABELS),
         })
     return clips

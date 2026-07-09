@@ -162,8 +162,12 @@ Enforcement rules the loop must self-check every cycle:
    marginal slippage at >1-clip size — handed to the forward `size_mult` probes.
 3. **Reward-harvesting MM deployment taxonomy** — which market tags (category/horizon/neg_risk/pool)
    is maker-reward net-positive on? That taxonomy becomes the deployment filter.
-4. ~~**Fix manifest coverage**~~ — FIXED 2026-07-09 (merged tags artifact, see §3). Re-run the
-   "unknown-is-profitable" de-confound with full tags before trusting the `norewards` mining cell.
+4. ~~**Fix manifest coverage**~~ — FIXED 2026-07-09 (merged tags artifact, see §3), and the
+   de-confounds are DONE: pool gate survives (none +7.9% vs paid −8.9%); ex-ante horizon edge is
+   **<3d** (3–14d negative — a `longshot_thin_0_3d` variant is the sharper future hypothesis); and
+   an entry-bucket smearing bug was found+fixed — the headline cell corrects to **+15.2% ROC**
+   (from +21.5%), honest post-slippage planning ~7–8%/cycle. → mining addendum +
+   `LONGSHOT_STATE_OF_PLAY.md` §4b.
 5. **Cross-event / basket arb** on neg-risk markets — the observation-only arb monitor (§3) now
    measures live opportunity frequency/depth; after ~1-2 weeks of scan lines, evaluate whether a
    taker overlay clears costs at our clip sizes.
