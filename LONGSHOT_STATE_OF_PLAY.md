@@ -193,3 +193,8 @@ before any post-restart results exist.
   `reports/EVAL_2026-07-22.md`).
 - **Tooling:** `longshot_market_analysis.py` now takes `--since`/`--until` (window) and `--config`
   (analyze `longshot_thin` vs `longshot`), so the eval runs both arms on the identical clean window.
+- **2026-07-09 mid-window restart (operator-authorized):** the paper-sim was redeployed on
+  2026-07-09 to add the 16-config expansion (`reports/prereg/paper-sim-expansion-2026-07-09.md`).
+  Open positions at restart were cut and marked at last mid (median hold ~2h, so the truncation
+  bite is small); resolved-position counting and the `--since 1783468800` window are unaffected;
+  the 07-22 eval must mention this discontinuity.

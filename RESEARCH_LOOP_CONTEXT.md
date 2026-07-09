@@ -21,10 +21,16 @@ bet, tested forward with a paper simulator that replays the live order book. The
   - `polybot-collect-all` — full-universe live CLOB order-book collector (raw L2 → S3).
   - `polybot-paper-sim` — paper market-making simulator (virtual orders, no real money).
 - **Paper-sim configs currently live** (`--size 0 --capital 5000 --fill-model prorata`, see
-  `deploy/polybot-paper-sim.service`): `neutral`, `neutral_ctl`, `predict_skew`, `predict_skew_ctl`,
-  `take_profit_3c`, `take_profit_3c_ctl`, `take_profit_5c`, `longshot` (control), **`longshot_thin`**
-  (the lead: 4–5¢ entry AND in-band depth <10k, walk-the-book fills), `tail_favorite`. `_ctl` =
-  deploy-everywhere/no-cull control for its strategy.
+  `deploy/polybot-paper-sim.service`): the original ten — `neutral`, `neutral_ctl`, `predict_skew`,
+  `predict_skew_ctl`, `take_profit_3c`, `take_profit_3c_ctl`, `take_profit_5c`, `longshot`
+  (control), **`longshot_thin`** (the lead: 4–5¢ entry AND in-band depth <10k, walk-the-book
+  fills), `tail_favorite` — plus the **2026-07-09 expansion** (16 configs, operator-authorized
+  mid-window redeploy; prereg `reports/prereg/paper-sim-expansion-2026-07-09.md`): 9 longshot
+  refinements/probes (`longshot_thin_shortdated/_norewards/_expolitics/_tp15/_tp30/_2x/_5x`,
+  `longshot_5_7_thin`, `longshot_thin_5k`), the buy-favorites family (`fav_hold`, `fav_politics`,
+  `fav_far`, `fav_politics_far`), and category-gated makers (`predict_skew_gencat`,
+  `take_profit_3c_gencat`, `neutral_gencat`). Eval dates: 2026-07-30 (longshot+makers),
+  2026-08-09 (favorites). `_ctl` = deploy-everywhere/no-cull control for its strategy.
 - **S3** `s3://polybot-polymarket-sjgibson` (us-east-1): `raw/dt=…` (order book, ~13–16 GB/day, best
   effort), `paper/dt=…` (per-minute virtual snapshots — the analysis dataset, small), `manifests/…`
   (token tags + reward params), `paper_sim_summary.json`.

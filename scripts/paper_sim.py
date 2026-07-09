@@ -188,6 +188,52 @@ CONFIGS = {
     # buy only 4-5c AND in-band depth <10k. Run head-to-head vs the unfiltered `longshot` control.
     "longshot_thin": dict(holder="longshot", buy_lo=0.04, buy_hi=0.05, max_book_depth=10000.0),
     "tail_favorite": dict(holder="tail", buy_lo=0.90, buy_hi=0.99),      # bet favorites (90c+)
+    # === 2026-07-09 EXPANSION (prereg: reports/prereg/paper-sim-expansion-2026-07-09.md).
+    # Sources: in-sample mining of the frozen window (reports/research/mining-insample-2026-07-09.md)
+    # + verified external evidence (reports/research/external-evidence-2026-07-09.md). Every family
+    # keeps its prior config as the live control. ---
+    # (A) longshot refinements on the 4-5c AND <10k lead, one gate per variant so each gate's
+    # marginal value is measured under walk-the-book fills:
+    "longshot_thin_shortdated": dict(holder="longshot", buy_lo=0.04, buy_hi=0.05,
+                                     max_book_depth=10000.0, max_horizon_days=14.0),
+    "longshot_thin_norewards": dict(holder="longshot", buy_lo=0.04, buy_hi=0.05,
+                                    max_book_depth=10000.0, max_reward_pool=1.0),
+    "longshot_thin_expolitics": dict(holder="longshot", buy_lo=0.04, buy_hi=0.05,
+                                     max_book_depth=10000.0,
+                                     exclude_categories={"politics", "geopolitics",
+                                                         "elections", "crypto"}),
+    "longshot_thin_tp15": dict(holder="longshot", buy_lo=0.04, buy_hi=0.05,
+                               max_book_depth=10000.0, take_profit_price=0.15),
+    "longshot_thin_tp30": dict(holder="longshot", buy_lo=0.04, buy_hi=0.05,
+                               max_book_depth=10000.0, take_profit_price=0.30),
+    # capacity probes: same filter at 2x/5x clip size — the walk-the-book fill measures the real
+    # marginal slippage curve the capacity eval (2026-07-09) could only bound parametrically:
+    "longshot_thin_2x": dict(holder="longshot", buy_lo=0.04, buy_hi=0.05,
+                             max_book_depth=10000.0, size_mult=2.0),
+    "longshot_thin_5x": dict(holder="longshot", buy_lo=0.04, buy_hi=0.05,
+                             max_book_depth=10000.0, size_mult=5.0),
+    # boundary probes: does the pocket extend above 5c / sharpen below 10k depth?
+    "longshot_5_7_thin": dict(holder="longshot", buy_lo=0.05, buy_hi=0.07, max_book_depth=10000.0),
+    "longshot_thin_5k": dict(holder="longshot", buy_lo=0.04, buy_hi=0.05, max_book_depth=5000.0),
+    # (B) BUY-FAVORITES family (external evidence: favorites 55c+ underpriced, strongest in
+    # politics at long horizon; edge vanishes near resolution). fav_hold is the family control:
+    "fav_hold": dict(holder="tail", buy_lo=0.55, buy_hi=0.90),
+    "fav_politics": dict(holder="tail", buy_lo=0.55, buy_hi=0.90,
+                         categories={"politics", "elections", "geopolitics"}),
+    "fav_far": dict(holder="tail", buy_lo=0.55, buy_hi=0.90, min_horizon_days=7.0),
+    "fav_politics_far": dict(holder="tail", buy_lo=0.55, buy_hi=0.90,
+                             categories={"politics", "elections", "geopolitics"},
+                             min_horizon_days=7.0),
+    # (C) maker CATEGORY-TAXONOMY gate (mining: tech/politics/weather/world net-positive for every
+    # core maker; sports/soccer/untagged bleed). Same strategy params as the ungated originals:
+    "predict_skew_gencat": dict(momentum_window=300, skew_threshold=0.004, debounce_trades=10,
+                                inv_skew=0.01, take_profit_cents=5.0, max_hold_minutes=10,
+                                min_mid=0.10, max_mid=0.90, liq_outside_band=True,
+                                categories={"tech", "politics", "weather", "world"}),
+    "take_profit_3c_gencat": dict(take_profit_cents=3.0, max_hold_minutes=10, min_mid=0.10,
+                                  max_mid=0.90, liq_outside_band=True,
+                                  categories={"tech", "politics", "weather", "world"}),
+    "neutral_gencat": dict(categories={"tech", "politics", "weather", "world"}),
     # CRYPTO maker: quotes ONLY the 5-min up/down markets, with hard guards so we exit well before
     # each resolution — short max-hold, tight stop/take, band liquidation. Tests whether the (often
     # richer) crypto reward pools beat their fast-resolution adverse selection. Returns-per-risk play.
@@ -405,6 +451,14 @@ class PaperSim:
         cats = cfg.get("categories")
         if cats and (m.get("category") or "unknown") not in cats:
             return False
+        xcats = cfg.get("exclude_categories")
+        if xcats and (m.get("category") or "unknown") in xcats:
+            return False
+        # only trade markets whose daily reward pool is at most this (mining: unpaid penny books
+        # have stale asks — the longshot edge concentrated where no maker is paid to tighten them).
+        mp = cfg.get("max_reward_pool")
+        if mp is not None and (m.get("pool") or 0.0) > mp:
+            return False
         return True
 
     def _ensure(self, tok: str) -> bool:
@@ -467,7 +521,8 @@ class PaperSim:
                 continue
             kw = dict(self.kw[c])
             for nk in ("allow_ephemeral", "roc_floor", "roc_ceil", "no_cull",
-                       "max_horizon_days", "min_horizon_days", "categories"):
+                       "max_horizon_days", "min_horizon_days", "categories",
+                       "exclude_categories", "max_reward_pool"):
                 kw.pop(nk, None)                          # selection knobs, not Quoter kwargs
             if kw.pop("_optimal", False):
                 s_star_c = optimal_offset_cents(m["v_cents"], m["pool"] / 1440.0, size)

@@ -114,6 +114,23 @@ class TestPerConfigMarketGate(unittest.TestCase):
             self.assertTrue(sim._ensure("T"))                  # politics matches -> Quoter built
             self.assertIn(("m_gate", "T"), sim.q)              # (categories popped, not a kwarg)
 
+    def test_exclude_categories_gate(self):
+        cfgs = {"x_gate": dict(holder="longshot", buy_lo=0.01, buy_hi=0.05,
+                               exclude_categories={"politics", "crypto"})}
+        with tempfile.TemporaryDirectory() as td:
+            sim = self._sim(Path(td), cfgs)
+            self.assertFalse(sim._ensure("T"))                 # politics is excluded
+            sim.meta["T"]["category"] = "sports"
+            self.assertTrue(sim._ensure("T"))
+
+    def test_max_reward_pool_gate(self):
+        cfgs = {"p_gate": dict(holder="longshot", buy_lo=0.01, buy_hi=0.05, max_reward_pool=1.0)}
+        with tempfile.TemporaryDirectory() as td:
+            sim = self._sim(Path(td), cfgs)
+            self.assertFalse(sim._ensure("T"))                 # pool=1440 > 1.0
+            sim.meta["T"]["pool"] = 0.5                        # tiny pool passes
+            self.assertTrue(sim._ensure("T"))
+
     def test_holder_size_mult(self):
         cfgs = {"big_clip": dict(holder="longshot", buy_lo=0.01, buy_hi=0.05, size_mult=5.0),
                 "one_clip": dict(holder="longshot", buy_lo=0.01, buy_hi=0.05)}
@@ -122,6 +139,23 @@ class TestPerConfigMarketGate(unittest.TestCase):
             self.assertTrue(sim._ensure("T"))
             self.assertEqual(sim.q[("big_clip", "T")].our_size,
                              5.0 * sim.q[("one_clip", "T")].our_size)
+
+    def test_all_service_configs_construct(self):
+        # every config named in the systemd unit must exist in CONFIGS and build a working
+        # Quoter/Holder for a plain durable market (catches name typos before deploy)
+        svc = (Path(__file__).resolve().parents[1] / "deploy" / "polybot-paper-sim.service").read_text()
+        args = svc.split("--configs")[1].split("--size")[0].replace("\\", " ").split()
+        self.assertGreaterEqual(len(args), 26)
+        missing = [a for a in args if a not in ps.CONFIGS]
+        self.assertEqual(missing, [])
+        with tempfile.TemporaryDirectory() as td:
+            meta = {"T": {"pool": 1440.0, "min_size": 100.0, "v_cents": 3.0,
+                          "question": "Will T win?", "category": "tech",
+                          "horizon_days": 10.0, "neg_risk": False}}
+            sim = ps.PaperSim(meta, size=200.0, inv_cap_mult=5.0, configs=args,
+                              fill_model="prorata", capture_mult=1.0, out_dir=Path(td),
+                              rotate_minutes=15.0)
+            self.assertTrue(sim._ensure("T"))   # no constructor blowups across the full set
 
     def test_old_meta_without_tag_fields_passes_gates(self):
         cfgs = {"h_gate2": dict(holder="longshot", buy_lo=0.01, buy_hi=0.05, max_horizon_days=14.0)}

@@ -16,6 +16,11 @@ ExecStart=/home/ec2-user/polymarket_exp/.venv/bin/python scripts/paper_sim.py \
     --live --configs neutral neutral_ctl predict_skew predict_skew_ctl \
       take_profit_3c take_profit_3c_ctl take_profit_5c \
       longshot longshot_thin tail_favorite \
+      longshot_thin_shortdated longshot_thin_norewards longshot_thin_expolitics \
+      longshot_thin_tp15 longshot_thin_tp30 longshot_thin_2x longshot_thin_5x \
+      longshot_5_7_thin longshot_thin_5k \
+      fav_hold fav_politics fav_far fav_politics_far \
+      predict_skew_gencat take_profit_3c_gencat neutral_gencat \
     --size 0 --capital 5000 --inv-cap-mult 5 --fill-model prorata --max-capture-share 0.10 \
     --min-roc 0.0 --max-roc 0.10 --cull-loss 3.0 --cull-cooldown 12 \
     --quote-latency 0.2 --cancel-on-move 0.01 --max-hold-minutes 120 \
