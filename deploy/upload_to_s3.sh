@@ -62,5 +62,12 @@ for m in "$SPOOL"/manifest_*.json; do
         || echo "$(date -u +%H:%M:%S) skip manifest $(basename "$m")"
 done
 
+# 2b) arb monitor: daily-append jsonl (small) — cp-overwrite each run, keep local (still appending).
+for a in "${POLYBOT_ARB:-/home/ec2-user/polymarket_exp/reports/arb_monitor}"/*.jsonl; do
+    [ -e "$a" ] || continue
+    aws s3 cp "$a" "s3://$BUCKET/arb/$(basename "$a")" --only-show-errors \
+        || echo "$(date -u +%H:%M:%S) skip arb $(basename "$a")"
+done
+
 # 3) raw order book: PARALLEL best-effort drain (large, self-capped/pruned upstream).
 ship "$SPOOL" book raw "$PAR_RAW"
