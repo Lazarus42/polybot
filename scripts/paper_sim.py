@@ -196,6 +196,10 @@ CONFIGS = {
     # marginal value is measured under walk-the-book fills:
     "longshot_thin_shortdated": dict(holder="longshot", buy_lo=0.04, buy_hi=0.05,
                                      max_book_depth=10000.0, max_horizon_days=14.0),
+    # amendment (2026-07-09): full-tags de-confound put the ex-ante horizon edge in <3d — the
+    # 3-14d band inside shortdated was negative in-sample. Sharper gate, same protocol:
+    "longshot_thin_0_3d": dict(holder="longshot", buy_lo=0.04, buy_hi=0.05,
+                               max_book_depth=10000.0, max_horizon_days=3.0),
     "longshot_thin_norewards": dict(holder="longshot", buy_lo=0.04, buy_hi=0.05,
                                     max_book_depth=10000.0, max_reward_pool=1.0),
     "longshot_thin_expolitics": dict(holder="longshot", buy_lo=0.04, buy_hi=0.05,

@@ -38,6 +38,13 @@ Configs under test:       longshot_thin_shortdated, longshot_thin_norewards,
                           longshot_thin_expolitics, longshot_thin_tp15, longshot_thin_tp30,
                           longshot_thin_2x, longshot_thin_5x, longshot_5_7_thin, longshot_thin_5k
                           (exact params in CONFIGS, commit-pinned with this file).
+                          AMENDMENT (2026-07-09, same day, BEFORE any forward result was seen):
+                          + longshot_thin_0_3d (4-5c, <10k, max_horizon_days=3, unknown passes) —
+                          added after the full-tags de-confound showed the ex-ante horizon edge
+                          concentrates in <3d (in-cell +39.2% vs 3-14d −5.6%); same metric, gate,
+                          control, and 2026-07-30 eval date as the other gate variants. The
+                          redeploy re-bases DEPLOY_EPOCH for ALL expansion arms (window was hours
+                          old and P&L-unseen; the discarded stub is documented, not analyzed).
 Control:                  longshot_thin (and longshot as the family baseline), same window.
 Primary metric:           roc_pct on RESOLVED positions (longshot_market_analysis.py --config X
                           --since <DEPLOY_EPOCH>), per config vs longshot_thin.
