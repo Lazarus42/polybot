@@ -46,10 +46,16 @@ except Exception:
 
 
 def load_manifest_tags(manifest_glob: str) -> dict[str, dict]:
+    """Load token tags from raw manifest_*.json files AND/OR a merged token_tags.json.gz artifact
+    (built by build_token_tags.py — the full-coverage union of every manifest; prefer it)."""
     tags: dict[str, dict] = {}
     for p in sorted(glob.glob(manifest_glob)):        # later manifests win (tags are stable)
         try:
-            tm = json.loads(Path(p).read_text()).get("token_meta") or {}
+            if p.endswith(".gz"):
+                with gzip.open(p, "rt") as fh:
+                    tm = json.load(fh).get("token_meta") or {}
+            else:
+                tm = json.loads(Path(p).read_text()).get("token_meta") or {}
         except Exception:
             continue
         for tok, m in tm.items():
