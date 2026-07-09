@@ -95,7 +95,12 @@ def load_token_meta(manifest: Path | None) -> dict:
             out[str(tok)] = {"pool": _f(m.get("reward_daily_est")) or 0.0,
                              "min_size": _f(m.get("rewards_min_size")) or 0.0,
                              "v_cents": v if v > 1 else v * 100.0,
-                             "question": m.get("question", "")}
+                             "question": m.get("question", ""),
+                             # per-config universe gates (max_horizon_days / categories) read these;
+                             # missing values stay None = "unknown" and pass the horizon gate.
+                             "category": m.get("category"),
+                             "horizon_days": _f(m.get("horizon_days")) if m.get("horizon_days") is not None else None,
+                             "neg_risk": bool(m.get("neg_risk"))}
     return out
 
 
@@ -382,6 +387,20 @@ class PaperSim:
         self.sizes[c][tok] = self.sizes[c].get(tok, 0.0) + cost   # so _retire frees it on resolution
         return True
 
+    def _cfg_market_gate(self, c: str, m: dict) -> bool:
+        """Per-config universe gate on manifest tags. `max_horizon_days`: skip markets KNOWN to
+        resolve further out (unknown horizon PASSES — ~half the penny universe is untagged and was
+        profitable, so a hard gate on unknown would discard real P&L for a data-coverage reason).
+        `categories`: quote only these categories ('unknown' is a listable value for untagged)."""
+        cfg = self.kw[c]
+        mh = cfg.get("max_horizon_days")
+        if mh and m.get("horizon_days") is not None and m["horizon_days"] > mh:
+            return False
+        cats = cfg.get("categories")
+        if cats and (m.get("category") or "unknown") not in cats:
+            return False
+        return True
+
     def _ensure(self, tok: str) -> bool:
         """Demand-driven allocation: only markets IN THE MANIFEST (m is not None) get quoted, and a
         strategy commits capital to one the first time it's seen streaming — if the market is durable,
@@ -402,19 +421,26 @@ class PaperSim:
             if "holder" in self.kw[c]:
                 if eph:                                   # holders skip the 5-min crypto churn
                     continue
+                if not self._cfg_market_gate(c, m):       # per-config horizon/category gate
+                    continue
                 any_active = True
                 if (c, tok) not in self.q:
                     cfg = self.kw[c]
-                    self.q[(c, tok)] = Holder(
-                        size, buy_lo=cfg["buy_lo"], buy_hi=cfg["buy_hi"],
+                    hsize = size * cfg.get("size_mult", 1.0)   # capacity probe: bigger clips walk
+                    self.q[(c, tok)] = Holder(                 # deeper into the ask ladder
+                        hsize, buy_lo=cfg["buy_lo"], buy_hi=cfg["buy_hi"],
                         max_book_depth=cfg.get("max_book_depth", 0.0),
                         max_fill_slippage=cfg.get("max_fill_slippage", 0.5),
+                        take_profit_price=cfg.get("take_profit_price", 0.0),
+                        stop_loss_price=cfg.get("stop_loss_price", 0.0),
                         commit_fn=(lambda cost, _c=c, _t=tok: self._commit(_c, _t, cost)),
-                        mids_maxlen=MIDS_MAXLEN, inventory_cap=size)
+                        mids_maxlen=MIDS_MAXLEN, inventory_cap=hsize)
                     self.allowed[c].add(tok)
                 continue
             # crypto strategies (allow_ephemeral) quote ONLY ephemeral markets; others ONLY durable
             if eph != bool(self.kw[c].get("allow_ephemeral")):
+                continue
+            if not self._cfg_market_gate(c, m):           # per-config horizon/category gate
                 continue
             if tok not in self.allowed[c]:
                 # consider committing capital to this freshly-seen market. ROC band is per-config
@@ -434,7 +460,8 @@ class PaperSim:
             if (c, tok) in self.q:
                 continue
             kw = dict(self.kw[c])
-            for nk in ("allow_ephemeral", "roc_floor", "roc_ceil", "no_cull"):
+            for nk in ("allow_ephemeral", "roc_floor", "roc_ceil", "no_cull",
+                       "max_horizon_days", "categories"):
                 kw.pop(nk, None)                          # selection knobs, not Quoter kwargs
             if kw.pop("_optimal", False):
                 s_star_c = optimal_offset_cents(m["v_cents"], m["pool"] / 1440.0, size)

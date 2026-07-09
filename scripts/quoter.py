@@ -31,10 +31,16 @@ class Holder:
     it calls `_do_flatten()`, settling the position at the last mid (~0 or ~1)."""
 
     def __init__(self, our_size, buy_lo=0.0, buy_hi=1.0, commit_fn=None, mids_maxlen=0,
-                 inventory_cap=0.0, max_book_depth=0.0, max_fill_slippage=0.5, **_ignore):
+                 inventory_cap=0.0, max_book_depth=0.0, max_fill_slippage=0.5,
+                 take_profit_price=0.0, stop_loss_price=0.0, **_ignore):
         self.our_size = our_size; self.buy_lo = buy_lo; self.buy_hi = buy_hi
         self.commit_fn = commit_fn or (lambda cost: True)
         self.inventory_cap = inventory_cap
+        # optional exits on ABSOLUTE mid thresholds (0 = disabled, hold to resolution): bank the pop
+        # once mid >= take_profit_price / cut once mid <= stop_loss_price. The sell executes at the
+        # BEST BID (crossing the spread; no bid-ladder walk — slightly optimistic in thin books).
+        self.take_profit_price = take_profit_price
+        self.stop_loss_price = stop_loss_price
         # only buy where in-band book depth (side_score bid+ask, same measure as the snapshot's
         # q_bid_book+q_ask_book) is below this. 0 = disabled. The analysis edge lived in <10k books.
         self.max_book_depth = max_book_depth
@@ -77,6 +83,15 @@ class Holder:
         m = self.mid()
         if m is not None:
             self.mids.append((t, m))
+        # price exits for an existing position: sell everything at the current best bid. The bought
+        # latch stays set, so an exited position never re-enters (one bet per market lifetime).
+        if self.bought and self.inv > 1e-9 and m is not None and bid is not None:
+            if (self.take_profit_price > 0 and m >= self.take_profit_price) or \
+               (self.stop_loss_price > 0 and m <= self.stop_loss_price):
+                self.cash += self.inv * bid
+                self.fills.append((t, -1, bid))
+                self.inv = 0.0; self.n_flats += 1
+                return
         if not self.bought and m is not None and self.buy_lo <= m <= self.buy_hi and ask is not None:
             # liquidity gate: if a depth cap is set, only buy in books thinner than it. If the cap is
             # on but depth wasn't supplied, don't buy (can't confirm the book is thin).
