@@ -78,8 +78,19 @@ bet, tested forward with a paper simulator that replays the live order book. The
 
 ## 3. Tooling the loop uses
 
-- **Pull data cheaply:** only `aws s3 sync` the `paper/` and `manifests/` prefixes; NEVER `raw/`
-  (100 GB/week egress). Aggregate before feeding any model. → `ANALYSIS_PLAN.md`.
+- **Pull data cheaply:** only `aws s3 sync` the `paper/` prefix and
+  `s3://…/tags/token_tags.json.gz`; NEVER `raw/` (100 GB/week egress). Aggregate before feeding any
+  model. → `ANALYSIS_PLAN.md`. **Prefer the tags artifact over raw `manifests/`**: it is the
+  ~7.6 MB union of ALL manifests (112,909 tokens vs ~13k in any single manifest) rebuilt daily on
+  the box (`deploy/build_token_tags_cron.sh`, cron 04:41 UTC) — this closed the ~50%-unknown
+  manifest-coverage gap (frontier item 4, fixed 2026-07-09). `load_manifest_tags` reads it
+  directly. It carries `horizon_days` (last-seen, short-biased) AND `horizon_days_first`
+  (first-seen, long-biased) — bracket horizon truth with both.
+- **Arb monitor (observation-only, deployed 2026-07-09):** `scripts/arb_monitor.py` runs on the box
+  via cron every 5 min, logging negRisk basket + YES/NO parity deviations (with min-touch-depth $)
+  from Gamma+CLOB REST to `s3://…/arb/{arb,scan}_YYYYMMDD.jsonl`. Zero-opportunity runs are logged
+  too (scan lines), so opportunity frequency is measurable either way. It never places orders.
+  First live run: 741 baskets/20.7k binaries discovered; volume-ranked head checked per run.
 - **`scripts/analyze_paper_sim.py`** — per-config aggregation (DuckDB): reward, trade P&L,
   `net_if_flat`, ROC/day, per-day/per-category. Flags: `--since/--until`, `--config`.
 - **`scripts/longshot_market_analysis.py`** — longshot/holder segmentation (pure stdlib, parallel).
@@ -151,8 +162,11 @@ Enforcement rules the loop must self-check every cycle:
    marginal slippage at >1-clip size — handed to the forward `size_mult` probes.
 3. **Reward-harvesting MM deployment taxonomy** — which market tags (category/horizon/neg_risk/pool)
    is maker-reward net-positive on? That taxonomy becomes the deployment filter.
-4. **Fix manifest coverage** so category/horizon slices aren't half-`unknown`.
-5. **Cross-event / basket arb** on neg-risk markets (the full-universe raw capture future-proofs this).
+4. ~~**Fix manifest coverage**~~ — FIXED 2026-07-09 (merged tags artifact, see §3). Re-run the
+   "unknown-is-profitable" de-confound with full tags before trusting the `norewards` mining cell.
+5. **Cross-event / basket arb** on neg-risk markets — the observation-only arb monitor (§3) now
+   measures live opportunity frequency/depth; after ~1-2 weeks of scan lines, evaluate whether a
+   taker overlay clears costs at our clip sizes.
 6. **Profit-taking on the longshot tail** (explored + reverted once; revisit under the entry/liquidity
    filter — does banking pops cut variance without gutting total).
 

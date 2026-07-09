@@ -46,7 +46,10 @@ If you'd rather work locally, the paper prefix is small enough that egress is st
 ```bash
 cd ~/Desktop/polymarket_exp
 aws s3 sync s3://polybot-polymarket-sjgibson/paper/     data/paper/       # ~0.3-0.5 GB, ~$0.03-0.05
-aws s3 sync s3://polybot-polymarket-sjgibson/manifests/ data/manifests/
+# tags: prefer the merged artifact (7.6 MB, union of ALL manifests — full coverage) over
+# syncing manifests/ (~4 GB of 8.5 MB point-in-time snapshots, each covering ~12% of tokens):
+aws s3 cp s3://polybot-polymarket-sjgibson/tags/token_tags.json.gz data/tags/token_tags.json.gz
+# then pass --manifest-glob 'data/tags/token_tags.json.gz' to the analysis scripts.
 pip install duckdb
 python scripts/analyze_paper_sim.py \
     --paper 'data/paper/dt=*/paper_*.jsonl.gz' \
