@@ -210,3 +210,15 @@ before any post-restart results exist.
   Open positions at restart were cut and marked at last mid (median hold ~2h, so the truncation
   bite is small); resolved-position counting and the `--since 1783468800` window are unaffected;
   the 07-22 eval must mention this discontinuity.
+
+## Eval log
+
+- **2026-07-22 — pre-registered eval attempt: INCONCLUSIVE (could not evaluate).** The scheduled run
+  environment had no S3 access (no aws CLI / boto3 / creds / network), so the `paper/`+`manifests/`
+  sync (step 2) could not run. The local mirror stops at 2026-07-07 20:56 UTC (~3h before the clean
+  window opens at 2026-07-08 00:00 UTC), so `--since 1783468800` returns **0 positions** for both
+  `longshot_thin` and the `longshot` control. Min-N gate (≥1000 resolved) not met on 0 data — this is
+  a data-availability failure, NOT a strategy result; no PASS/FAIL recorded, criteria unchanged.
+  Action: re-run on a box with S3 access after confirming post-2026-07-08 snapshots actually exist in
+  s3://polybot-polymarket-sjgibson/paper/ (guard against a repeat of the June-25 uploader break).
+  Recommend re-schedule ~2026-07-29. Full write-up: reports/EVAL_2026-07-22.md.
